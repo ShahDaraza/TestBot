@@ -119,7 +119,7 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Node client for the command hub')
-    parser.add_argument('--host', default=' 192.168.100.9', help='Hub hostname or IP address')
+    parser.add_argument('--host', default='192.168.100.9', help='Hub hostname or IP address')
     parser.add_argument('--port', type=int, default=9999, help='Hub port')
     args = parser.parse_args()
 
