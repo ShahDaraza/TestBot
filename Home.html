@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Live Chaos Globe</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: black; }
+    h1 {
+      position: absolute;
+      top: 10%; /* headline moved upward */
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 3em;
+      color: white;
+      text-shadow: 0 0 20px #00ffff, 0 0 40px #ff00ff;
+      animation: glow 2s infinite alternate;
+      z-index: 10;
+    }
+    @keyframes glow {
+      from { text-shadow: 0 0 10px #00ffff, 0 0 20px #ff00ff; }
+      to { text-shadow: 0 0 40px #ffff00, 0 0 60px #ff0000; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Heelow Wellcom to the Chaos</h1>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script>
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 2000);
+    const renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // Lighting: simulates the Sun
+    const ambientLight = new THREE.AmbientLight(0x222222);
+    scene.add(ambientLight);
+    const sunLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    sunLight.position.set(5,3,5);
+    scene.add(sunLight);
+
+    // Load textures
+    const loader = new THREE.TextureLoader();
+    const earthDay = loader.load("https://raw.githubusercontent.com/trevorjayjones/earth-textures/main/earthmap1k.jpg");
+    const earthNight = loader.load("https://raw.githubusercontent.com/trevorjayjones/earth-textures/main/earthlights1k.jpg");
+    const bumpMap = loader.load("https://raw.githubusercontent.com/trevorjayjones/earth-textures/main/earthbump1k.jpg");
+    const cloudsTexture = loader.load("https://raw.githubusercontent.com/trevorjayjones/earth-textures/main/earthclouds.png");
+
+    // Earth globe with day/night blending
+    const earthGeometry = new THREE.SphereGeometry(2, 64, 64);
+    const earthMaterial = new THREE.MeshPhongMaterial({
+      map: earthDay,
+      bumpMap: bumpMap,
+      bumpScale: 0.05,
+      emissiveMap: earthNight, // city lights at night
+      emissive: new THREE.Color(0xffffff),
+      emissiveIntensity: 0.6
+    });
+    const earth = new THREE.Mesh(earthGeometry, earthMaterial);
+    scene.add(earth);
+
+    // Clouds layer
+    const cloudGeometry = new THREE.SphereGeometry(2.03, 64, 64);
+    const cloudMaterial = new THREE.MeshPhongMaterial({
+      map: cloudsTexture,
+      transparent: true,
+      opacity: 0.8
+    });
+    const clouds = new THREE.Mesh(cloudGeometry, cloudMaterial);
+    scene.add(clouds);
+
+    // Starfield
+    const starGeometry = new THREE.BufferGeometry();
+    const starCount = 5000;
+    const starVertices = [];
+    for (let i = 0; i < starCount; i++) {
+      const x = (Math.random() - 0.5) * 4000;
+      const y = (Math.random() - 0.5) * 4000;
+      const z = (Math.random() - 0.5) * 4000;
+      starVertices.push(x,y,z);
+    }
+    starGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starVertices, 3));
+    const starMaterial = new THREE.PointsMaterial({ color: 0xffffff, size: 0.7 });
+    const stars = new THREE.Points(starGeometry, starMaterial);
+    scene.add(stars);
+
+    camera.position.z = 8;
+
+    // Animate
+    function animate() {
+      requestAnimationFrame(animate);
+      earth.rotation.y += 0.001; // slow Earth rotation
+      clouds.rotation.y += 0.0015; // clouds drift
+      stars.rotation.y += 0.0002; // subtle star drift
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
