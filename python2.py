@@ -1,10 +1,23 @@
-import socket
-import time
+import argparse
+import base64
+import ctypes
+import getpass
+import hashlib
+import importlib
+import json
 import os
-import sys
-import subprocess 
-import threading
+import platform
+import random
 import shutil
+import socket
+import sqlite3
+import string
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import winreg
 
 def install_dependencies():
     required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow']
