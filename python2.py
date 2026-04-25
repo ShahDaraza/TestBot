@@ -1,23 +1,10 @@
-import argparse
-import base64
-import ctypes
-import getpass
-import hashlib
-import importlib
-import json
-import os
-import platform
-import random
-import shutil
 import socket
-import sqlite3
-import string
-import subprocess
-import sys
-import threading
 import time
-import uuid
-import winreg
+import os
+import sys
+import subprocess  # <--- THIS IS THE MISSING LINE
+import threading
+import shutil
 
 def install_dependencies():
     required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow']
