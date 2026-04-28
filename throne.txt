@@ -1,1 +1,1 @@
-signs-league-pollution-words.trycloudflare.com
+test-domain.trycloudflare.com
