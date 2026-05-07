@@ -1442,3 +1442,4 @@ if __name__ == '__main__':
     threading.Thread(target=auto_update_monitor, daemon=True).start()
 
     main_loop(args.hub_ip, args.hub_port, args.github_throne_url)
+
