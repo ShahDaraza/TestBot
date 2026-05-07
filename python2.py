@@ -1046,6 +1046,7 @@ def connect_to_king(king_url):
 
             print(f"[*] Localtonet destination from throne: {host}:{port}")
             print(f"[*] Connecting directly to Localtonet TCP: {host}:{port}")
+            print(f"[*] Connected via GitHub throne route to King at {host}:{port}")
 
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(10)
@@ -1119,13 +1120,16 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
             use_throne = bool(github_throne_url)
             
             if use_throne:
+                print(f"[*] Connection mode: GitHub throne")
                 print(f"[*] Fetching hub address from throne: {github_throne_url}")
                 king_url = get_king_url(github_throne_url)
                 if king_url:
+                    print(f"[*] Resolved throne endpoint: {king_url}")
                     client, buffer = connect_to_king(king_url)
                 else:
-                    print(f"[-] Failed to get throne URL, trying direct connection to {hub_ip}:{port}")
-                    client, buffer = connect_direct_hub(hub_ip, port) if hub_ip else (None, b'')
+                    print(f"[-] Failed to get throne URL. Retrying in 10 seconds...")
+                    time.sleep(10)
+                    continue
             else:
                 print(f"[*] Connecting directly to hub at {hub_ip}:{port}")
                 client, buffer = connect_direct_hub(hub_ip, port) if hub_ip else (None, b'')
@@ -1419,13 +1423,14 @@ if __name__ == '__main__':
     print(f'PIL:       {"available" if PIL_AVAILABLE else "missing"}')
     print('============================================================\n')
     if args.github_throne_url:
+        print(f'[*] Connection mode: GitHub throne')
         print(f'[*] Using GitHub throne to resolve King domain: {args.github_throne_url}')
     else:
+        print(f'[*] Connection mode: direct TCP')
         print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
 
     # Start auto-update monitor
     threading.Thread(target=auto_update_monitor, daemon=True).start()
 
     main_loop(args.hub_ip, args.hub_port, args.github_throne_url)
-
 
