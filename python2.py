@@ -633,11 +633,19 @@ def perform_self_update(remote_version, script_bytes):
         return False
 
 
+update_pending = False
+
 def auto_update_monitor():
     """Monitor GitHub for updates in the background."""
+    global update_pending
     while True:
         try:
-            check_for_updates()
+            # Check for updates without performing immediate self-update
+            remote_version = get_remote_version()
+            if remote_version:
+                local_version = read_local_version()
+                if parse_semantic_version(remote_version) > parse_semantic_version(local_version):
+                    update_pending = True  # Set flag only, do not kill connection yet
         except Exception:
             pass
         time.sleep(UPDATE_CHECK_INTERVAL)
