@@ -16,7 +16,7 @@ from typing import Dict, Optional, Tuple
 # ============================================================
 # MANUAL LOCALTONET TUNNEL CONFIGURATION
 # ============================================================
-PUBLIC_URL = "ufazduoqpe.localto.net:7229"
+PUBLIC_URL = "ufazduoqpe.localto.net:7196"
 
 try:
     import websockets
