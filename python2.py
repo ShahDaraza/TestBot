@@ -20,7 +20,7 @@ import winreg
 from urllib.parse import urlparse
 
 def install_dependencies():
-    required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow', 'websocket-client']
+    required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow', 'websocket-client', 'pywin32']
     for lib in required:
         try:
             __import__(lib if lib != 'pycryptodome' else 'Crypto')
@@ -88,7 +88,7 @@ except ImportError:
     psutil = None
     PSUTIL_AVAILABLE = False
 
-REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
+REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip', 'pywin32']
 
 # Default command hub settings. These values can be overridden by
 # environment variables KING_HUB_IP / KING_HUB_PORT or by passing
